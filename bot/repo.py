@@ -1,0 +1,412 @@
+"""Domain data access: users, wallet ledger, orders, logs, settings.
+
+Encrypted: Telegram ID, names, balances, amounts, order params/replies, log
+details. Plain (needed for queries and not sensitive): HMAC user hash, order
+status, product id/name, quantities, timestamps.
+
+Collections:
+  users/{user_hash}
+  orders/{order_uuid}
+  ledger/{entry_id}         wallet movements (kept, no TTL)
+  logs/{id}                 user activity (expire_at -> Firestore TTL policy)
+  owner_logs/{id}           owner actions
+  settings/global           maintenance flag, margin
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any
+
+from .money import ZERO, to_decimal
+from .security import Crypto
+from .store import Store, Tx, new_id
+
+USERS, ORDERS, LEDGER, LOGS, OWNER_LOGS, SETTINGS = (
+    "users", "orders", "ledger", "logs", "owner_logs", "settings")
+
+OPEN_STATUSES = ("processing", "wait", "unknown")
+FINAL_STATUSES = ("accept", "reject")
+
+
+class InsufficientFunds(Exception):
+    def __init__(self, balance: Decimal, needed: Decimal):
+        super().__init__(f"balance {balance} < {needed}")
+        self.balance = balance
+        self.needed = needed
+
+
+class UserNotFound(Exception):
+    pass
+
+
+class UserBanned(Exception):
+    pass
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@dataclass
+class User:
+    hash: str
+    telegram_id: int
+    username: str
+    first_name: str
+    balance: Decimal
+    banned: bool
+    created_at: datetime | None
+
+
+@dataclass
+class Order:
+    uuid: str
+    user_hash: str
+    status: str
+    refunded: bool
+    product_id: int
+    product_name: str
+    qty: int
+    amount: Decimal
+    cost: Decimal
+    params: dict[str, str]
+    provider_order_id: str | None
+    provider_price: str | None
+    replay: Any
+    attempts: int
+    last_error: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+
+    @property
+    def is_final(self) -> bool:
+        return self.status in FINAL_STATUSES
+
+
+@dataclass
+class LedgerEntry:
+    id: str
+    type: str
+    amount: Decimal
+    balance_after: Decimal
+    ref: str | None
+    note: str
+    created_at: datetime | None
+
+
+class Repo:
+    def __init__(self, store: Store, crypto: Crypto, log_retention_days: int = 180):
+        self.store = store
+        self.crypto = crypto
+        self.retention = timedelta(days=log_retention_days)
+
+    # -- crypto helpers ----------------------------------------------------
+    def _enc(self, coll: str, doc_id: str, field: str, value: str) -> str:
+        return self.crypto.encrypt(value, f"{coll}/{doc_id}/{field}")
+
+    def _dec(self, coll: str, doc_id: str, field: str, token: str | None, default: str = "") -> str:
+        if not token:
+            return default
+        return self.crypto.decrypt(token, f"{coll}/{doc_id}/{field}")
+
+    def user_hash(self, telegram_id: int) -> str:
+        return self.crypto.user_hash(telegram_id)
+
+    # -- users -------------------------------------------------------------
+    def _user(self, uhash: str, d: dict) -> User:
+        return User(
+            hash=uhash,
+            telegram_id=int(self._dec(USERS, uhash, "tg_id", d.get("tg_id_enc"), "0")),
+            username=self._dec(USERS, uhash, "username", d.get("username_enc")),
+            first_name=self._dec(USERS, uhash, "first_name", d.get("first_name_enc")),
+            balance=to_decimal(self._dec(USERS, uhash, "balance", d.get("balance_enc"), "0")),
+            banned=bool(d.get("banned", False)),
+            created_at=d.get("created_at"),
+        )
+
+    async def ensure_user(self, telegram_id: int, username: str | None,
+                          first_name: str | None) -> tuple[User, bool]:
+        """Register the user if new; refresh profile fields. Returns (user, created)."""
+        uhash = self.user_hash(telegram_id)
+        now = utcnow()
+
+        async def fn(tx: Tx):
+            doc = await tx.get(USERS, uhash)
+            profile = {
+                "username_enc": self._enc(USERS, uhash, "username", username or ""),
+                "first_name_enc": self._enc(USERS, uhash, "first_name", first_name or ""),
+                "last_seen": now,
+            }
+            if doc is None:
+                doc = {
+                    "tg_id_enc": self._enc(USERS, uhash, "tg_id", str(telegram_id)),
+                    "balance_enc": self._enc(USERS, uhash, "balance", "0"),
+                    "banned": False,
+                    "created_at": now,
+                    **profile,
+                }
+                tx.set(USERS, uhash, doc)
+                return doc, True
+            tx.merge(USERS, uhash, profile)
+            doc.update(profile)
+            return doc, False
+
+        doc, created = await self.store.run_transaction(fn)
+        return self._user(uhash, doc), created
+
+    async def get_user(self, telegram_id: int) -> User | None:
+        return await self.get_user_by_hash(self.user_hash(telegram_id))
+
+    async def get_user_by_hash(self, uhash: str) -> User | None:
+        doc = await self.store.get(USERS, uhash)
+        return self._user(uhash, doc) if doc else None
+
+    async def set_banned(self, telegram_id: int, banned: bool) -> None:
+        uhash = self.user_hash(telegram_id)
+        if not await self.store.get(USERS, uhash):
+            raise UserNotFound(telegram_id)
+        await self.store.merge(USERS, uhash, {"banned": banned})
+
+    # -- wallet --------------------------------------------------------------
+    def _ledger_doc(self, entry_id: str, uhash: str, kind: str, amount: Decimal,
+                    balance_after: Decimal, ref: str | None, note: str, actor: str | None) -> dict:
+        return {
+            "user_hash": uhash,
+            "type": kind,
+            "amount_enc": self._enc(LEDGER, entry_id, "amount", str(amount)),
+            "balance_after_enc": self._enc(LEDGER, entry_id, "balance_after", str(balance_after)),
+            "note_enc": self._enc(LEDGER, entry_id, "note", note),
+            "ref": ref,
+            "actor": actor,
+            "created_at": utcnow(),
+        }
+
+    async def adjust_balance(self, telegram_id: int, delta: Decimal, kind: str,
+                             note: str = "", actor: str | None = None) -> Decimal:
+        """Owner credit/debit. Raises InsufficientFunds if it would go negative."""
+        uhash = self.user_hash(telegram_id)
+        entry_id = new_id()
+
+        async def fn(tx: Tx):
+            doc = await tx.get(USERS, uhash)
+            if doc is None:
+                raise UserNotFound(telegram_id)
+            balance = to_decimal(self._dec(USERS, uhash, "balance", doc.get("balance_enc"), "0"))
+            new_balance = balance + delta
+            if new_balance < ZERO:
+                raise InsufficientFunds(balance, -delta)
+            tx.merge(USERS, uhash, {"balance_enc": self._enc(USERS, uhash, "balance", str(new_balance))})
+            tx.set(LEDGER, entry_id,
+                   self._ledger_doc(entry_id, uhash, kind, delta, new_balance, None, note, actor))
+            return new_balance
+
+        return await self.store.run_transaction(fn)
+
+    async def ledger_for_user(self, telegram_id: int, limit: int = 10) -> list[LedgerEntry]:
+        uhash = self.user_hash(telegram_id)
+        rows = await self.store.query(LEDGER, [("user_hash", "==", uhash)],
+                                      order_by="created_at", descending=True, limit=limit)
+        return [
+            LedgerEntry(
+                id=i,
+                type=d["type"],
+                amount=to_decimal(self._dec(LEDGER, i, "amount", d.get("amount_enc"), "0")),
+                balance_after=to_decimal(self._dec(LEDGER, i, "balance_after",
+                                                   d.get("balance_after_enc"), "0")),
+                ref=d.get("ref"),
+                note=self._dec(LEDGER, i, "note", d.get("note_enc")),
+                created_at=d.get("created_at"),
+            )
+            for i, d in rows
+        ]
+
+    # -- orders --------------------------------------------------------------
+    def _order(self, ouuid: str, d: dict) -> Order:
+        replay_raw = self._dec(ORDERS, ouuid, "replay", d.get("replay_enc"), "null")
+        return Order(
+            uuid=ouuid,
+            user_hash=d["user_hash"],
+            status=d["status"],
+            refunded=bool(d.get("refunded", False)),
+            product_id=int(d["product_id"]),
+            product_name=d.get("product_name", ""),
+            qty=int(d.get("qty", 1)),
+            amount=to_decimal(self._dec(ORDERS, ouuid, "amount", d.get("amount_enc"), "0")),
+            cost=to_decimal(self._dec(ORDERS, ouuid, "cost", d.get("cost_enc"), "0")),
+            params=json.loads(self._dec(ORDERS, ouuid, "params", d.get("params_enc"), "{}")),
+            provider_order_id=d.get("provider_order_id"),
+            provider_price=self._dec(ORDERS, ouuid, "provider_price", d.get("provider_price_enc")) or None,
+            replay=json.loads(replay_raw),
+            attempts=int(d.get("attempts", 0)),
+            last_error=d.get("last_error"),
+            created_at=d.get("created_at"),
+            updated_at=d.get("updated_at"),
+        )
+
+    async def create_order_with_debit(self, telegram_id: int, order_uuid: str, product_id: int,
+                                      product_name: str, qty: int, amount: Decimal, cost: Decimal,
+                                      params: dict[str, str]) -> tuple[Order, bool]:
+        """Atomically debit the wallet and create the order.
+
+        Idempotent on order_uuid: a second call (double tap, retry) returns the
+        existing order with created=False and does NOT debit again.
+        """
+        uhash = self.user_hash(telegram_id)
+        ledger_id = f"debit_{order_uuid}"
+        now = utcnow()
+
+        async def fn(tx: Tx):
+            existing = await tx.get(ORDERS, order_uuid)
+            user = await tx.get(USERS, uhash)
+            if existing is not None:
+                if existing["user_hash"] != uhash:
+                    raise PermissionError("order_uuid belongs to another user")
+                return existing, False
+            if user is None:
+                raise UserNotFound(telegram_id)
+            if user.get("banned"):
+                raise UserBanned(telegram_id)
+            balance = to_decimal(self._dec(USERS, uhash, "balance", user.get("balance_enc"), "0"))
+            if balance < amount:
+                raise InsufficientFunds(balance, amount)
+            new_balance = balance - amount
+            doc = {
+                "user_hash": uhash,
+                "status": "processing",
+                "refunded": False,
+                "product_id": product_id,
+                "product_name": product_name,
+                "qty": qty,
+                "amount_enc": self._enc(ORDERS, order_uuid, "amount", str(amount)),
+                "cost_enc": self._enc(ORDERS, order_uuid, "cost", str(cost)),
+                "params_enc": self._enc(ORDERS, order_uuid, "params",
+                                        json.dumps(params, ensure_ascii=False)),
+                "provider_order_id": None,
+                "attempts": 0,
+                "last_error": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            tx.merge(USERS, uhash, {"balance_enc": self._enc(USERS, uhash, "balance", str(new_balance))})
+            tx.set(ORDERS, order_uuid, doc)
+            tx.set(LEDGER, ledger_id, self._ledger_doc(
+                ledger_id, uhash, "order", -amount, new_balance, order_uuid, product_name, None))
+            return doc, True
+
+        doc, created = await self.store.run_transaction(fn)
+        return self._order(order_uuid, doc), created
+
+    async def get_order(self, order_uuid: str) -> Order | None:
+        doc = await self.store.get(ORDERS, order_uuid)
+        return self._order(order_uuid, doc) if doc else None
+
+    async def mark_open(self, order_uuid: str, status: str, provider_order_id: str | None = None,
+                        error: str | None = None, count_attempt: bool = False) -> bool:
+        """Move a non-final order to processing/wait/unknown. No-op on final orders."""
+        assert status in OPEN_STATUSES
+
+        async def fn(tx: Tx):
+            doc = await tx.get(ORDERS, order_uuid)
+            if doc is None or doc["status"] in FINAL_STATUSES:
+                return False
+            patch: dict[str, Any] = {"status": status, "updated_at": utcnow(), "last_error": error}
+            if provider_order_id:
+                patch["provider_order_id"] = provider_order_id
+            if count_attempt:
+                patch["attempts"] = int(doc.get("attempts", 0)) + 1
+            tx.merge(ORDERS, order_uuid, patch)
+            return True
+
+        return await self.store.run_transaction(fn)
+
+    async def finalize(self, order_uuid: str, status: str, provider_order_id: str | None = None,
+                       provider_price: Decimal | None = None, replay: Any = None,
+                       error: str | None = None) -> Order | None:
+        """Set accept/reject exactly once. A reject refunds the wallet in the same
+        transaction. Returns the updated order, or None if it was already final
+        (so callers notify the user only once)."""
+        assert status in FINAL_STATUSES
+        ledger_id = f"refund_{order_uuid}"
+
+        async def fn(tx: Tx):
+            doc = await tx.get(ORDERS, order_uuid)
+            if doc is None or doc["status"] in FINAL_STATUSES:
+                return None
+            uhash = doc["user_hash"]
+            user = await tx.get(USERS, uhash) if status == "reject" else None
+            patch: dict[str, Any] = {"status": status, "updated_at": utcnow(), "last_error": error}
+            if provider_order_id:
+                patch["provider_order_id"] = provider_order_id
+            if provider_price is not None:
+                patch["provider_price_enc"] = self._enc(ORDERS, order_uuid, "provider_price",
+                                                        str(provider_price))
+            if replay is not None:
+                patch["replay_enc"] = self._enc(ORDERS, order_uuid, "replay",
+                                                json.dumps(replay, ensure_ascii=False))
+            if status == "reject" and not doc.get("refunded"):
+                amount = to_decimal(self._dec(ORDERS, order_uuid, "amount", doc.get("amount_enc"), "0"))
+                balance = to_decimal(self._dec(USERS, uhash, "balance",
+                                               (user or {}).get("balance_enc"), "0"))
+                new_balance = balance + amount
+                patch["refunded"] = True
+                tx.merge(USERS, uhash, {"balance_enc": self._enc(USERS, uhash, "balance", str(new_balance))})
+                tx.set(LEDGER, ledger_id, self._ledger_doc(
+                    ledger_id, uhash, "refund", amount, new_balance, order_uuid,
+                    doc.get("product_name", ""), None))
+            tx.merge(ORDERS, order_uuid, patch)
+            doc.update(patch)
+            return doc
+
+        doc = await self.store.run_transaction(fn)
+        return self._order(order_uuid, doc) if doc else None
+
+    async def orders_for_user(self, telegram_id: int, limit: int = 10) -> list[Order]:
+        rows = await self.store.query(ORDERS, [("user_hash", "==", self.user_hash(telegram_id))],
+                                      order_by="created_at", descending=True, limit=limit)
+        return [self._order(i, d) for i, d in rows]
+
+    async def open_orders(self, limit: int = 100) -> list[Order]:
+        rows = await self.store.query(ORDERS, [("status", "in", list(OPEN_STATUSES))], limit=limit)
+        return [self._order(i, d) for i, d in rows]
+
+    # -- logs ----------------------------------------------------------------
+    async def log_user(self, telegram_id: int, action: str, details: str = "") -> None:
+        log_id = new_id()
+        now = utcnow()
+        await self.store.set(LOGS, log_id, {
+            "user_hash": self.user_hash(telegram_id),
+            "action": action,
+            "details_enc": self._enc(LOGS, log_id, "details", details),
+            "created_at": now,
+            "expire_at": now + self.retention,  # Firestore TTL deletes it after this
+        })
+
+    async def log_owner(self, owner_id: int, action: str, details: str = "") -> None:
+        log_id = new_id()
+        await self.store.set(OWNER_LOGS, log_id, {
+            "owner_hash": self.user_hash(owner_id),
+            "owner_enc": self._enc(OWNER_LOGS, log_id, "owner", str(owner_id)),
+            "action": action,
+            "details_enc": self._enc(OWNER_LOGS, log_id, "details", details),
+            "created_at": utcnow(),
+        })
+
+    async def owner_logs(self, limit: int = 20) -> list[tuple[datetime, int, str, str]]:
+        rows = await self.store.query(OWNER_LOGS, order_by="created_at", descending=True, limit=limit)
+        return [
+            (d.get("created_at"),
+             int(self._dec(OWNER_LOGS, i, "owner", d.get("owner_enc"), "0")),
+             d.get("action", ""),
+             self._dec(OWNER_LOGS, i, "details", d.get("details_enc")))
+            for i, d in rows
+        ]
+
+    # -- settings ------------------------------------------------------------
+    async def get_settings(self) -> dict:
+        return await self.store.get(SETTINGS, "global") or {}
+
+    async def update_settings(self, **fields) -> None:
+        await self.store.merge(SETTINGS, "global", fields)
