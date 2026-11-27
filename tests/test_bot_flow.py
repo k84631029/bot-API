@@ -207,10 +207,13 @@ async def test_ban_and_rate_limit(h):
 
 
 async def test_insufficient_balance_message(h):
+    # Balance drops after the order was started: the confirm step still refuses.
     await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 10")
     await h.press(CUSTOMER, "p:18")
     await h.text(CUSTOMER, "PLAYER1")
     confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("o:"))
+    await h.text(OWNER, f"/debit {CUSTOMER} 10")
     await h.press(CUSTOMER, confirm["callback_data"])
     assert "رصيدك ما يكفي" in h.tg.last_text(CUSTOMER)
     assert h.g4s.orders == {}
@@ -529,3 +532,44 @@ async def test_rename_rejects_bad_names_and_customers(h):
     await h.text(CUSTOMER, "hacked")
     settings = await h.svc.repo.get_settings()
     assert not settings.get("category_names") and not settings.get("product_names")
+
+
+
+async def test_products_locked_when_balance_is_too_low(h):
+    key = await _pubg_key(h)
+    await h.text(CUSTOMER, "/start")  # balance 0
+    await h.press(CUSTOMER, f"k:{key}:0")
+    assert "رصيدك ما يكفي" in h.tg.last_text(CUSTOMER)
+    [locked] = [b for b in h.tg.last_buttons(CUSTOMER) if b["text"].startswith("🔒")]
+    assert locked["disabled"] == {} and "callback_data" not in locked
+
+    # An old app (or a crafted tap) still can't start the order.
+    await h.press(CUSTOMER, "p:18")
+    assert "رصيدك ما يكفي" in h.tg.alerts()[-1]["text"]
+    await h.text(CUSTOMER, "5123456789")
+    assert "اختر من القائمة" in h.tg.last_text(CUSTOMER)
+
+    await h.text(OWNER, f"/credit {CUSTOMER} 10")
+    await h.press(CUSTOMER, f"k:{key}:0")
+    buttons = h.tg.last_buttons(CUSTOMER)
+    assert not any(b["text"].startswith("🔒") or "disabled" in b for b in buttons)
+    assert any(b.get("callback_data") == "p:18" for b in buttons)
+    assert "رصيدك: 10.00" in h.tg.last_text(CUSTOMER)
+
+
+async def test_disabled_buttons_fall_back_if_telegram_refuses(h, monkeypatch):
+    from telegram.error import BadRequest
+    key = await _pubg_key(h)
+    await h.text(CUSTOMER, "/start")
+    real = h.tg.do_request
+
+    async def picky(url, method, request_data=None, **kw):
+        markup = (request_data.parameters if request_data else {}).get("reply_markup") or {}
+        if any("disabled" in b for row in markup.get("inline_keyboard", []) for b in row):
+            raise BadRequest("Bad Request: unsupported button")
+        return await real(url, method, request_data, **kw)
+
+    monkeypatch.setattr(h.tg, "do_request", picky)
+    await h.press(CUSTOMER, f"k:{key}:0")
+    [locked] = [b for b in h.tg.last_buttons(CUSTOMER) if b["text"].startswith("🔒")]
+    assert locked["callback_data"] == "p:18" and "disabled" not in locked

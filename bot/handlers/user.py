@@ -9,7 +9,7 @@ from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from ..g4s import G4SError, G4SUnavailable, Product
-from ..money import to_decimal
+from ..money import ZERO, to_decimal
 from ..orders import PLAYER_BLOCKED_TEXT, OrderRejectedBeforeDebit, PlayerBlocked, PriceChanged
 from ..repo import InsufficientFunds, UserBanned
 from . import owner
@@ -173,6 +173,35 @@ async def categories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: i
     await _show(update, "🛒 اختر القسم:", InlineKeyboardMarkup(rows))
 
 
+def _min_qty(p: Product) -> int:
+    return p.qty.choices[0] if p.qty.kind == "choices" else p.qty.min
+
+
+async def _balance(s, telegram_id: int):
+    user = await s.repo.get_user(telegram_id)
+    return user.balance if user else ZERO
+
+
+def _product_rows(items, key: str, page: int, total: int,
+                  use_disabled: bool) -> list[list[InlineKeyboardButton]]:
+    """items: (product, label, locked). A locked product (balance below its price)
+    gets a 🔒 and, when use_disabled, Telegram's disabled button (grey, does
+    nothing; Bot API 10.3). Without it, tapping shows the "balance too low" alert."""
+    rows = []
+    for p, label, locked in items:
+        if locked and use_disabled:
+            button = InlineKeyboardButton(f"🔒 {label}", api_kwargs={"disabled": {}})
+        elif locked:
+            button = InlineKeyboardButton(f"🔒 {label}", callback_data=f"p:{p.id}")
+        else:
+            button = InlineKeyboardButton(label, callback_data=f"p:{p.id}")
+        rows.append([button])
+    if nav := _pager(f"k:{key}", page, total):
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 الأقسام", callback_data="c:0")])
+    return rows
+
+
 async def category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     q = update.callback_query
@@ -188,30 +217,43 @@ async def category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if cat is None:
         await categories(update, context)
         return
-    chunk = cat.products[page * PAGE:(page + 1) * PAGE]
-    rows = []
-    for p in chunk:
-        min_qty = p.qty.choices[0] if p.qty.kind == "choices" else p.qty.min
-        price = await s.runtime.price(p, min_qty)
+    balance = await _balance(s, update.effective_user.id)
+    items = []
+    for p in cat.products[page * PAGE:(page + 1) * PAGE]:
+        price = await s.runtime.price(p, _min_qty(p))
         prefix = "من " if p.qty.kind != "one" else ""
         name = await s.runtime.product_name(p)
-        rows.append([InlineKeyboardButton(f"{name[:40]} — {prefix}{s.money(price)}",
-                                          callback_data=f"p:{p.id}")])
-    if nav := _pager(f"k:{key}", page, len(cat.products)):
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("🔙 الأقسام", callback_data="c:0")])
-    await _show(update, f"<b>{esc(await s.runtime.category_name(cat))}</b>\nاختر المنتج:",
-                InlineKeyboardMarkup(rows))
+        items.append((p, f"{name[:40]} — {prefix}{s.money(price)}", balance < price))
+    text = (f"<b>{esc(await s.runtime.category_name(cat))}</b>\n"
+            f"رصيدك: {s.money(balance)}\n")
+    if any(locked for _, _, locked in items):
+        text += "🔒 رصيدك ما يكفي لهذا المنتج، اشحن من «➕ شحن الرصيد».\n"
+    text += "اختر المنتج:"
+    try:
+        await _show(update, text, InlineKeyboardMarkup(
+            _product_rows(items, key, page, len(cat.products), use_disabled=True)))
+    except BadRequest as exc:
+        # Telegram refused the disabled buttons: send ordinary 🔒 buttons instead.
+        log.warning("Disabled buttons refused, falling back: %s", exc)
+        await _show(update, text, InlineKeyboardMarkup(
+            _product_rows(items, key, page, len(cat.products), use_disabled=False)))
 
 
 async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     q = update.callback_query
-    await q.answer()
     p = await s.catalog.product(int(q.data.split(":")[1]))
     if p is None or not p.available or not await s.runtime.is_visible(p.id):
+        await q.answer()
         await reply(update, "المنتج غير متوفر حالياً.")
         return
+    price = await s.runtime.price(p, _min_qty(p))
+    balance = await _balance(s, update.effective_user.id)
+    if balance < price:
+        await q.answer(f"🔒 رصيدك ما يكفي\nرصيدك: {s.money(balance)}\n"
+                       f"السعر: {s.money(price)}\nاشحن من «➕ شحن الرصيد»", show_alert=True)
+        return
+    await q.answer()
     context.user_data["draft"] = {"product_id": p.id, "values": [], "qty": None,
                                   "uuid": None, "total": None}
     await _next_step(update, context, p)
