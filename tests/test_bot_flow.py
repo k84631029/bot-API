@@ -119,6 +119,7 @@ async def h():
 async def test_full_purchase_flow(h):
     await h.text(CUSTOMER, "/start")
     assert "أهلاً" in h.tg.last_text(CUSTOMER)
+    assert f"🆔: <code>{CUSTOMER}</code>" in h.tg.last_text(CUSTOMER)
 
     await h.text(OWNER, "/start")
     await h.text(OWNER, f"/credit {CUSTOMER} 10 تحويل بنكي")
@@ -133,7 +134,7 @@ async def test_full_purchase_flow(h):
     assert "1.21" in product_btn["text"]
 
     await h.press(CUSTOMER, "p:18")
-    assert "ادخل الايدي الاعب" in h.tg.last_text(CUSTOMER)
+    assert "✍️ ايدي الشحن:" in h.tg.last_text(CUSTOMER)
     await h.text(CUSTOMER, "5123456789")
     assert "تأكيد الطلب" in h.tg.last_text(CUSTOMER)
     confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("o:"))
@@ -447,5 +448,20 @@ async def test_order_messages_show_the_label_the_customer_saw(h):
     await h.press(CUSTOMER, confirm["callback_data"])
     text = h.tg.last_text(CUSTOMER)
     assert "تم تنفيذ طلبك بنجاح" in text
-    assert "ادخل الايدي الاعب: <code>5123456789</code>" in text
+    assert "ايدي الشحن: <code>5123456789</code>" in text
+    assert "ادخل الايدي الاعب" not in text
     assert "playerId" not in text
+
+
+async def test_topup_and_confirm_texts(h):
+    await h.text(CUSTOMER, "➕ شحن الرصيد")
+    text = h.tg.last_text(CUSTOMER)
+    assert "طرق الدفع" in text and "USDT" in text
+    assert f"ايديك تيليجرام: <code>{CUSTOMER}</code>" in text
+    assert "طلب شحن محفظة: @support" in text
+
+    await h.text(OWNER, f"/credit {CUSTOMER} 10")
+    await h.press(CUSTOMER, "p:18")
+    await h.text(CUSTOMER, "5123456789")
+    confirm = h.tg.last_text(CUSTOMER)
+    assert "تأكيد الطلب" in confirm and "ايدي الشحن: <code>5123456789</code>" in confirm

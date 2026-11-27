@@ -23,6 +23,9 @@ BTN_ORDERS = "📦 طلباتي"
 BTN_LEDGER = "🧾 سجل المحفظة"
 BTN_TOPUP = "➕ شحن الرصيد"
 BTN_ADMIN = "🛠 لوحة المالك"
+# What customers see for the first field of every product (the player ID),
+# whatever name the provider gives it.
+PLAYER_ID_LABEL = "ايدي الشحن"
 
 STATUS_LABELS = {
     "processing": "⏳ قيد التنفيذ",
@@ -115,11 +118,21 @@ def order_text(order: Order, s: Services, detailed: bool = False) -> str:
     return "\n".join(lines)
 
 
+def field_label(provider_label: str, index: int) -> str:
+    """Name shown to the customer for a product field: the first field is always
+    the player ID; extra fields keep the provider's name."""
+    if index == 0:
+        return PLAYER_ID_LABEL
+    return provider_label.strip().rstrip(":：").strip()
+
+
 def param_label(order: Order, index: int, key: str) -> str:
-    """The field name the customer saw (e.g. "PLAYER ID"), not the API key."""
+    """The field name the customer saw, not the API key."""
+    if index == 0:
+        return PLAYER_ID_LABEL
     if index < len(order.labels) and order.labels[index].strip():
-        return order.labels[index].strip().rstrip(":：").strip()
-    return "PLAYER ID" if key == "playerId" else key  # orders made before labels were saved
+        return field_label(order.labels[index], index)
+    return key
 
 
 def _flatten(replay) -> str:

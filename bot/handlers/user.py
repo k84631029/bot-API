@@ -14,7 +14,7 @@ from ..orders import PLAYER_BLOCKED_TEXT, OrderRejectedBeforeDebit, PlayerBlocke
 from ..repo import InsufficientFunds, UserBanned
 from . import owner
 from .common import (BTN_BALANCE, BTN_LEDGER, BTN_ORDERS, BTN_PRODUCTS, BTN_TOPUP, LEDGER_LABELS,
-                     STATUS_LABELS, esc, main_keyboard, order_text, reply, svc, when)
+                     STATUS_LABELS, esc, field_label, main_keyboard, order_text, reply, svc, when)
 
 log = logging.getLogger(__name__)
 PAGE = 10
@@ -63,7 +63,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     context.user_data.pop("draft", None)
     name = esc(update.effective_user.first_name or "")
-    await reply(update, f"أهلاً {name} 👋\nاختر من القائمة تحت.",
+    await reply(update, f"أهلاً {name} 👋\n🆔: <code>{update.effective_user.id}</code>\n\n"
+                        "اختر من القائمة تحت.",
                 reply_markup=main_keyboard(s.is_owner(update.effective_user.id)))
 
 
@@ -78,12 +79,14 @@ async def topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     contact = s.settings.support_contact
     text = (
         "➕ <b>شحن الرصيد</b>\n"
-        "الشحن حالياً يدوي: حوّل المبلغ وأرسل الإيصال مع رقمك التالي، "
-        "ونضيف الرصيد لمحفظتك.\n\n"
-        f"رقمك: <code>{update.effective_user.id}</code>"
+        "الشحن حالياً يدوي: يتم شحن محفظتك واستخدام رصيدك أي وقت.\n\n"
+        "<b>طرق الدفع</b>\n"
+        "داخل السعودية: راجحي، برق، STC Bank، رابط دفع محلي\n"
+        "خارج السعودية: رابط دفع دولي، جنيه مصري، USDT\n\n"
+        f"ايديك تيليجرام: <code>{update.effective_user.id}</code>"
     )
     if contact:
-        text += f"\nالتواصل: {esc(contact)}"
+        text += f"\nطلب شحن محفظة: {esc(contact)}"
     await reply(update, text)
 
 
@@ -215,8 +218,9 @@ async def _next_step(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Prod
     s = svc(context)
     draft = context.user_data["draft"]
     if len(draft["values"]) < len(p.params):
-        label = p.params[len(draft["values"])]
-        await reply(update, f"<b>{esc(p.name)}</b>\n✍️ {esc(label)}:")
+        index = len(draft["values"])
+        label = field_label(p.params[index], index)
+        await reply(update, f"<b>{esc(p.name)}</b>\n\n✍️ {esc(label)}:")
         return
     if draft["qty"] is None:
         if p.qty.kind == "one":
@@ -243,8 +247,8 @@ async def _confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Produc
         draft["uuid"] = str(uuid.uuid4())
     user = await s.repo.get_user(update.effective_user.id)
     lines = ["🧾 <b>تأكيد الطلب</b>", f"المنتج: {esc(p.name)}", f"الكمية: {draft['qty']}"]
-    for label, value in zip(p.params, draft["values"]):
-        lines.append(f"{esc(label)}: <code>{esc(value)}</code>")
+    for index, (label, value) in enumerate(zip(p.params, draft["values"])):
+        lines.append(f"{esc(field_label(label, index))}: <code>{esc(value)}</code>")
     lines += [f"الإجمالي: <b>{s.money(to_decimal(draft['total']))}</b>",
               f"رصيدك: {s.money(user.balance)}",
               "\nتأكد من البيانات، الطلب ما يتلغى بعد التنفيذ."]
