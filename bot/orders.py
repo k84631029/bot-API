@@ -123,7 +123,7 @@ class OrderService:
 
         # Raises InsufficientFunds / UserBanned with nothing charged.
         order, created = await self.repo.create_order_with_debit(
-            telegram_id, order_uuid, product.id, product.name, qty, total,
+            telegram_id, order_uuid, product.id, await self.runtime.product_name(product), qty, total,
             product.price * qty, api_params(product, values), labels=list(product.params))
         if not created:
             return PlaceResult(order, duplicate=True)

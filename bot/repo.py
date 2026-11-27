@@ -440,6 +440,24 @@ class Repo:
         return await self.store.run_transaction(fn)
 
 
+    # -- custom display names ---------------------------------------------------
+    async def set_display_name(self, kind: str, key: str, name: str | None) -> None:
+        """Owner's name for a category (key = category key) or a product
+        (key = product id). name=None goes back to the provider's name."""
+        field = {"category": "category_names", "product": "product_names"}[kind]
+
+        async def fn(tx: Tx):
+            doc = await tx.get(SETTINGS, "global") or {}
+            names = dict(doc.get(field) or {})
+            if name:
+                names[str(key)] = name
+            else:
+                names.pop(str(key), None)
+            # set (not merge): merge would keep a removed key inside the map
+            tx.set(SETTINGS, "global", {**doc, field: names})
+
+        await self.store.run_transaction(fn)
+
     # -- blocked player IDs ---------------------------------------------------
     def _player_tag(self, value: str) -> str:
         # 32 hex chars keeps the ID short enough for Telegram button data.

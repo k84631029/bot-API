@@ -119,6 +119,14 @@ class RuntimeSettings:
         raw = (await self._get()).get("margin_percent")
         return to_decimal(raw) if raw is not None else self.default_margin
 
+    async def category_name(self, cat: Category) -> str:
+        """Owner's custom name for the category, else the provider's."""
+        return ((await self._get()).get("category_names") or {}).get(cat.key) or cat.name
+
+    async def product_name(self, product: Product) -> str:
+        """Owner's custom name for the product, else the provider's."""
+        return ((await self._get()).get("product_names") or {}).get(str(product.id)) or product.name
+
     async def visible_products(self) -> frozenset[int]:
         """Product IDs the owner allowed customers to see. Empty = none."""
         return frozenset(int(i) for i in (await self._get()).get("visible_products") or [])

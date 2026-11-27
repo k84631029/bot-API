@@ -97,7 +97,7 @@ async def panel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await q.answer()
     parts = q.data.split(":")
     action = parts[1] if len(parts) > 1 else ""
-    if action in {"pv", "pk", "pt", "pa"}:
+    if action in {"pv", "pk", "pt", "pa", "cn", "pn"}:
         await _products_button(update, context, action, parts[2:])
         return
     arg = parts[2] if len(parts) > 2 else ""
@@ -424,6 +424,8 @@ async def _products_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
       a:pk:<cat>:<page>                 products of a category
       a:pt:<cat>:<page>:<product_id>    toggle one product
       a:pa:<cat>:<page>:<1|0>           show/hide the whole category
+      a:cn:<cat>:<page>                 rename the category
+      a:pn:<cat>:<page>:<product_id>    rename a product
     """
     try:
         if action == "pv":
@@ -438,6 +440,10 @@ async def _products_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await _pv_toggle(update, context, key, page, int(args[2]))
         elif action == "pa" and args[2] in {"0", "1"}:
             await _pv_whole_category(update, context, key, page, args[2] == "1")
+        elif action == "cn":
+            await _ask_rename(update, context, "category", key, page, key)
+        elif action == "pn":
+            await _ask_rename(update, context, "product", key, page, str(int(args[2])))
     except (IndexError, ValueError):
         return
     except (G4SError, G4SUnavailable) as exc:
@@ -482,7 +488,8 @@ async def _pv_categories(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
     for c in cats[page * PV_PAGE:(page + 1) * PV_PAGE]:
         on = sum(1 for p in c.products if p.id in visible)
         mark = "✅" if on == len(c.products) else ("🟡" if on else "⬜")
-        rows.append([InlineKeyboardButton(f"{mark} {c.name[:45]} ({on}/{len(c.products)})",
+        name = await s.runtime.category_name(c)
+        rows.append([InlineKeyboardButton(f"{mark} {name[:45]} ({on}/{len(c.products)})",
                                           callback_data=f"a:pk:{c.key}:0")])
     if nav := _nav("a:pv", page, len(cats)):
         rows.append(nav)
@@ -507,15 +514,22 @@ async def _pv_category(update: Update, context: ContextTypes.DEFAULT_TYPE, key: 
         min_qty = p.qty.choices[0] if p.qty.kind == "choices" else p.qty.min
         price = await s.runtime.price(p, min_qty)
         na = " ⛔" if not p.available else ""
-        rows.append([InlineKeyboardButton(f"{mark} {p.name[:35]} — {s.money(price)}{na}",
-                                          callback_data=f"a:pt:{key}:{page}:{p.id}")])
+        name = await s.runtime.product_name(p)
+        rows.append([InlineKeyboardButton(f"{mark} {name[:32]} — {s.money(price)}{na}",
+                                          callback_data=f"a:pt:{key}:{page}:{p.id}"),
+                     InlineKeyboardButton("✏️", callback_data=f"a:pn:{key}:{page}:{p.id}")])
     rows.append([InlineKeyboardButton("✅ إظهار الكل", callback_data=f"a:pa:{key}:{page}:1"),
                  InlineKeyboardButton("⬜ إخفاء الكل", callback_data=f"a:pa:{key}:{page}:0")])
+    rows.append([InlineKeyboardButton("✏️ تغيير اسم القسم", callback_data=f"a:cn:{key}:{page}")])
     if nav := _nav(f"a:pk:{key}", page, len(cat.products)):
         rows.append(nav)
     rows.append([InlineKeyboardButton("🔙 الأقسام", callback_data="a:pv:0")])
-    text = (f"🧩 <b>{esc(cat.name)}</b>\n"
-            "اضغط على المنتج عشان تظهره للعملاء أو تخفيه.\n✅ ظاهر  ⬜ مخفي")
+    shown_name = await s.runtime.category_name(cat)
+    text = f"🧩 <b>{esc(shown_name)}</b>\n"
+    if shown_name != cat.name:
+        text += f"(اسمه عند المزود: {esc(cat.name)})\n"
+    text += ("اضغط على المنتج عشان تظهره للعملاء أو تخفيه.\n✅ ظاهر  ⬜ مخفي\n"
+             "✏️ لتغيير اسم المنتج")
     if any(not p.available for p in cat.products):
         text += "\n⛔ غير متوفر عند المزود (ما يظهر للعملاء لين يتوفر)"
     await _edit_or_reply(update, text, InlineKeyboardMarkup(rows))
@@ -638,6 +652,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
             return True
         _clear_step(context)
         await _set_margin(update, context, value)
+        return True
+
+    if kind == "rename":
+        if text == "-":
+            name = None
+        elif not text or len(text) > 60 or "\n" in text:
+            await reply(update, "اسم غير صالح. اكتبه في سطر واحد (حد أقصى 60 حرف):",
+                        reply_markup=CANCEL_MARKUP)
+            return True
+        else:
+            name = text
+        _clear_step(context)
+        await s.repo.set_display_name(step["target"], step["key"], name)
+        s.runtime.invalidate()
+        await _audit(context, update, f"rename_{step['target']}",
+                     f"{step['original']} -> {name or '(الاسم الأصلي)'}")
+        await reply(update, f"✅ تم. الاسم الجديد: <b>{esc(name)}</b>" if name
+                    else f"✅ رجع الاسم الأصلي: <b>{esc(step['original'])}</b>")
+        await _pv_category(update, context, step["cat"], step["page"])
         return True
 
     if kind == "block_player":
@@ -926,3 +959,30 @@ async def _btn_block_from_order(update: Update, context: ContextTypes.DEFAULT_TY
         await reply(update, "ما لقيت آيدي لاعب في هذا الطلب.")
         return
     await _block(update, context, player_id)
+
+
+
+async def _ask_rename(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str,
+                      cat_key: str, page: int, key: str) -> None:
+    """Ask the owner for a new name for a category or a product."""
+    s = svc(context)
+    cat = await s.catalog.category(cat_key)
+    if cat is None:
+        await _pv_categories(update, context, 0)
+        return
+    if target == "category":
+        original, current = cat.name, await s.runtime.category_name(cat)
+    else:
+        product = next((p for p in cat.products if str(p.id) == key), None)
+        if product is None:
+            return
+        original, current = product.name, await s.runtime.product_name(product)
+    _set_step(context, "rename", target=target, key=key, cat=cat_key, page=page,
+              original=original)
+    what = "القسم" if target == "category" else "المنتج"
+    await reply(update, f"✏️ <b>تغيير اسم {what}</b>\n"
+                        f"الاسم الحالي: {esc(current)}\n"
+                        f"اسمه عند المزود: {esc(original)}\n\n"
+                        "أرسل الاسم الجديد اللي يشوفه العملاء.\n"
+                        "أو أرسل <code>-</code> عشان ترجّع اسم المزود.",
+                reply_markup=CANCEL_MARKUP)

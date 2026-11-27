@@ -465,3 +465,67 @@ async def test_topup_and_confirm_texts(h):
     await h.text(CUSTOMER, "5123456789")
     confirm = h.tg.last_text(CUSTOMER)
     assert "تأكيد الطلب" in confirm and "ايدي الشحن: <code>5123456789</code>" in confirm
+
+
+async def _pubg_key(h):
+    return next(c.key for c in await h.svc.catalog.categories() if c.name == "PUBG Global ID UC")
+
+
+async def test_owner_renames_category_and_product(h):
+    key = await _pubg_key(h)
+    await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 10")
+
+    await h.press(OWNER, f"a:cn:{key}:0")
+    assert "تغيير اسم القسم" in h.tg.last_text(OWNER)
+    await h.text(OWNER, "شدات ببجي فوري ID")
+    assert "(اسمه عند المزود: PUBG Global ID UC)" in h.tg.last_text(OWNER)
+
+    await h.press(OWNER, f"a:pn:{key}:0:18")
+    await h.text(OWNER, "60 شده")
+    assert any(b["text"].startswith("✅ 60 شده") for b in h.tg.last_buttons(OWNER))
+
+    await h.text(CUSTOMER, "🛒 المنتجات")
+    names = [b["text"] for b in h.tg.last_buttons(CUSTOMER)]
+    assert "شدات ببجي فوري ID" in names and "PUBG Global ID UC" not in names
+    await h.press(CUSTOMER, f"k:{key}:0")
+    assert "<b>شدات ببجي فوري ID</b>" in h.tg.last_text(CUSTOMER)
+    assert any(b["text"].startswith("60 شده — ") for b in h.tg.last_buttons(CUSTOMER))
+
+    await h.press(CUSTOMER, "p:18")
+    assert "<b>60 شده</b>" in h.tg.last_text(CUSTOMER)
+    await h.text(CUSTOMER, "5123456789")
+    assert "المنتج: 60 شده" in h.tg.last_text(CUSTOMER)
+    confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("o:"))
+    await h.press(CUSTOMER, confirm["callback_data"])
+    assert "<b>60 شده</b> × 1" in h.tg.last_text(CUSTOMER)
+    [order] = await h.svc.repo.orders_for_user(CUSTOMER)
+    assert order.product_name == "60 شده"
+
+    # "-" goes back to the provider's names
+    await h.press(OWNER, f"a:cn:{key}:0")
+    await h.text(OWNER, "-")
+    await h.press(OWNER, f"a:pn:{key}:0:18")
+    await h.text(OWNER, "-")
+    await h.text(CUSTOMER, "🛒 المنتجات")
+    assert "PUBG Global ID UC" in [b["text"] for b in h.tg.last_buttons(CUSTOMER)]
+    assert await h.svc.repo.get_settings() and \
+        (await h.svc.repo.get_settings()).get("category_names") == {}
+    logs = [a for _, _, a, _ in await h.svc.repo.owner_logs()]
+    assert "rename_category" in logs and "rename_product" in logs
+
+
+async def test_rename_rejects_bad_names_and_customers(h):
+    key = await _pubg_key(h)
+    await h.press(OWNER, f"a:cn:{key}:0")
+    await h.text(OWNER, "x" * 61)
+    assert "اسم غير صالح" in h.tg.last_text(OWNER)
+    await h.press(OWNER, "a:cx")
+
+    await h.text(CUSTOMER, "/start")
+    await h.press(CUSTOMER, f"a:cn:{key}:0")
+    await h.text(CUSTOMER, "hacked")
+    await h.press(CUSTOMER, f"a:pn:{key}:0:18")
+    await h.text(CUSTOMER, "hacked")
+    settings = await h.svc.repo.get_settings()
+    assert not settings.get("category_names") and not settings.get("product_names")

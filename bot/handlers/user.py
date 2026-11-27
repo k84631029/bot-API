@@ -165,8 +165,9 @@ async def categories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: i
     if not cats:
         await reply(update, "ما فيه منتجات متاحة حالياً.")
         return
-    chunk = cats[page * PAGE:(page + 1) * PAGE]
-    rows = [[InlineKeyboardButton(c.name[:60], callback_data=f"k:{c.key}:0")] for c in chunk]
+    named = sorted([(await s.runtime.category_name(c), c) for c in cats], key=lambda nc: nc[0])
+    chunk = named[page * PAGE:(page + 1) * PAGE]
+    rows = [[InlineKeyboardButton(name[:60], callback_data=f"k:{c.key}:0")] for name, c in chunk]
     if nav := _pager("c", page, len(cats)):
         rows.append(nav)
     await _show(update, "🛒 اختر القسم:", InlineKeyboardMarkup(rows))
@@ -193,12 +194,14 @@ async def category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         min_qty = p.qty.choices[0] if p.qty.kind == "choices" else p.qty.min
         price = await s.runtime.price(p, min_qty)
         prefix = "من " if p.qty.kind != "one" else ""
-        rows.append([InlineKeyboardButton(f"{p.name[:40]} — {prefix}{s.money(price)}",
+        name = await s.runtime.product_name(p)
+        rows.append([InlineKeyboardButton(f"{name[:40]} — {prefix}{s.money(price)}",
                                           callback_data=f"p:{p.id}")])
     if nav := _pager(f"k:{key}", page, len(cat.products)):
         rows.append(nav)
     rows.append([InlineKeyboardButton("🔙 الأقسام", callback_data="c:0")])
-    await _show(update, f"<b>{esc(cat.name)}</b>\nاختر المنتج:", InlineKeyboardMarkup(rows))
+    await _show(update, f"<b>{esc(await s.runtime.category_name(cat))}</b>\nاختر المنتج:",
+                InlineKeyboardMarkup(rows))
 
 
 async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -220,7 +223,7 @@ async def _next_step(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Prod
     if len(draft["values"]) < len(p.params):
         index = len(draft["values"])
         label = field_label(p.params[index], index)
-        await reply(update, f"<b>{esc(p.name)}</b>\n\n✍️ {esc(label)}:")
+        await reply(update, f"<b>{esc(await s.runtime.product_name(p))}</b>\n\n✍️ {esc(label)}:")
         return
     if draft["qty"] is None:
         if p.qty.kind == "one":
@@ -246,7 +249,8 @@ async def _confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, p: Produc
     if draft["uuid"] is None:
         draft["uuid"] = str(uuid.uuid4())
     user = await s.repo.get_user(update.effective_user.id)
-    lines = ["🧾 <b>تأكيد الطلب</b>", f"المنتج: {esc(p.name)}", f"الكمية: {draft['qty']}"]
+    lines = ["🧾 <b>تأكيد الطلب</b>", f"المنتج: {esc(await s.runtime.product_name(p))}",
+             f"الكمية: {draft['qty']}"]
     for index, (label, value) in enumerate(zip(p.params, draft["values"])):
         lines.append(f"{esc(field_label(label, index))}: <code>{esc(value)}</code>")
     lines += [f"الإجمالي: <b>{s.money(to_decimal(draft['total']))}</b>",
