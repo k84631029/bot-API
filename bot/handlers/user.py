@@ -227,7 +227,8 @@ async def category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (f"<b>{esc(await s.runtime.category_name(cat))}</b>\n"
             f"رصيدك: {s.money(balance)}\n")
     if any(locked for _, _, locked in items):
-        text += "🔒 رصيدك ما يكفي لهذا المنتج، اشحن من «➕ شحن الرصيد».\n"
+        text += ("🔒 إذا ظهر لك قفل على منتج يعني رصيدك ما يكفي لهذا المنتج،\n"
+                 "اضغط زر «➕ شحن الرصيد» بالأسفل.\n")
     text += "اختر المنتج:"
     try:
         await _show(update, text, InlineKeyboardMarkup(
