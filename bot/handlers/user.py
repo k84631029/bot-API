@@ -14,8 +14,8 @@ from ..orders import PLAYER_BLOCKED_TEXT, OrderRejectedBeforeDebit, PlayerBlocke
 from ..repo import InsufficientFunds, UserBanned
 from . import owner
 from .common import (BTN_BALANCE, BTN_LEDGER, BTN_ORDERS, BTN_PRODUCTS, BTN_TOPUP, HOME_ROW,
-                     LEDGER_LABELS, MENU_TEXT, STATUS_LABELS, TOPUP_BUTTON, bottom_keyboard, esc,
-                     field_label, home_markup, menu_markup, order_text, reply, svc, when)
+                     LEDGER_LABELS, STATUS_LABELS, TOPUP_BUTTON, bottom_keyboard, esc,
+                     field_label, home_markup, menu_markup, menu_text, order_text, reply, svc, when)
 
 log = logging.getLogger(__name__)
 PAGE = 10
@@ -63,13 +63,22 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     context.user_data.pop("draft", None)
-    tg_id = update.effective_user.id
-    name = esc(update.effective_user.first_name or "")
-    # Two messages: a message can carry either the bottom keyboard (owner button /
-    # removal of the old customer keyboard) or inline buttons, not both.
-    await reply(update, f"أهلاً {name} 👋\n🆔: <code>{tg_id}</code>",
-                reply_markup=bottom_keyboard(s.is_owner(tg_id)))
-    await reply(update, MENU_TEXT, reply_markup=menu_markup())
+    await _set_bottom_keyboard(update, s.is_owner(update.effective_user.id))
+    await reply(update, menu_text(update.effective_user), reply_markup=menu_markup())
+
+
+async def _set_bottom_keyboard(update: Update, is_owner: bool) -> None:
+    """Set the keyboard under the text box (owner: panel button; customers: none).
+
+    A message can carry either this keyboard or inline buttons, not both, so it
+    rides on a short helper message that is deleted right away; the keyboard
+    change stays in effect."""
+    try:
+        helper = await update.effective_message.reply_text(
+            "🔄", reply_markup=bottom_keyboard(is_owner))
+        await helper.delete()
+    except Exception as exc:  # cosmetic only; never block /start
+        log.info("Bottom keyboard update failed: %s", exc)
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -81,7 +90,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.callback_query.answer()
     if item == "home":
         context.user_data.pop("draft", None)
-        await _show(update, MENU_TEXT, menu_markup())
+        await _show(update, menu_text(update.effective_user, back=True), menu_markup())
     elif item == "bal":
         await balance(update, context)
     elif item == "top":
@@ -380,7 +389,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     s = svc(context)
     draft = context.user_data.get("draft")
     if not draft or draft["uuid"]:
-        await reply(update, MENU_TEXT, reply_markup=menu_markup())
+        await reply(update, menu_text(update.effective_user, back=True), reply_markup=menu_markup())
         return
     p = await s.catalog.product(draft["product_id"])
     if p is None or not await s.runtime.is_visible(p.id):

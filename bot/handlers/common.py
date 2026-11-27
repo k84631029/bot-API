@@ -94,7 +94,12 @@ def bottom_keyboard(is_owner: bool) -> ReplyKeyboardMarkup | ReplyKeyboardRemove
 # Inline main menu (callback data "m:<item>").
 HOME_ROW = [InlineKeyboardButton("🏠 القائمة", callback_data="m:home")]
 TOPUP_BUTTON = InlineKeyboardButton(BTN_TOPUP, callback_data="m:top")
-MENU_TEXT = "اختر من القائمة:"
+def menu_text(user, back: bool = False) -> str:
+    """Main menu text. back=True when returning to it with "🏠 القائمة"."""
+    greet = "أهلاً بعودتك" if back else "أهلاً"
+    return (f"{greet} {esc(user.first_name or '')} 👋\n"
+            f"🆔: <code>{user.id}</code>\n\n"
+            "اختر من القائمة:")
 
 
 def menu_markup() -> InlineKeyboardMarkup:

@@ -118,10 +118,12 @@ async def h():
 
 async def test_full_purchase_flow(h):
     await h.text(CUSTOMER, "/start")
-    greeting, menu = h.tg.sent(CUSTOMER)[-2:]
-    assert "أهلاً" in greeting["text"] and f"🆔: <code>{CUSTOMER}</code>" in greeting["text"]
-    assert greeting["reply_markup"] == {"remove_keyboard": True}  # old keyboard gone
-    assert "اختر من القائمة" in menu["text"]
+    helper, menu = h.tg.sent(CUSTOMER)[-2:]
+    assert helper["reply_markup"] == {"remove_keyboard": True}  # old keyboard gone
+    assert ("deleteMessage", CUSTOMER) in [(n, p.get("chat_id")) for n, p in h.tg.calls]
+    assert menu["text"] == (f"أهلاً U{CUSTOMER} 👋\n🆔: <code>{CUSTOMER}</code>\n\n"
+                            "اختر من القائمة:")
+    assert menu["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "m:shop"
 
     await h.text(OWNER, "/start")
     await h.text(OWNER, f"/credit {CUSTOMER} 10 تحويل بنكي")
@@ -599,7 +601,8 @@ async def test_inline_main_menu(h):
     await h.press(CUSTOMER, "m:shop")
     assert "اختر القسم" in h.tg.last_text(CUSTOMER) and home_in_last()
     await h.press(CUSTOMER, "m:home")
-    assert h.tg.last_text(CUSTOMER) == "اختر من القائمة:"
+    assert h.tg.last_text(CUSTOMER).startswith(f"أهلاً بعودتك U{CUSTOMER} 👋\n🆔: <code>{CUSTOMER}</code>")
+    assert [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)][0] == "m:shop"
 
     # Menu taps edit the same message instead of sending new ones.
     names = [n for n, p in h.tg.calls if p.get("chat_id") == CUSTOMER]
@@ -608,8 +611,9 @@ async def test_inline_main_menu(h):
 
 async def test_owner_keeps_only_the_panel_button_below(h):
     await h.text(OWNER, "/start")
-    greeting = h.tg.sent(OWNER)[-2]
-    assert greeting["reply_markup"]["keyboard"] == [[{"text": "🛠 لوحة المالك"}]]
+    helper = h.tg.sent(OWNER)[-2]
+    assert helper["reply_markup"]["keyboard"] == [[{"text": "🛠 لوحة المالك"}]]
+    assert h.tg.last_text(OWNER).startswith("أهلاً U")
     await h.text(OWNER, "🛠 لوحة المالك")
     assert "لوحة المالك" in h.tg.last_text(OWNER)
 
