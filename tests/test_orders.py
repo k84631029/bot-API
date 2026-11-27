@@ -5,7 +5,7 @@ from decimal import Decimal
 import pytest
 
 from bot.catalog import Catalog, RuntimeSettings
-from bot.g4s import G4SClient
+from bot.g4s import G4SClient, G4SUnavailable
 from bot.orders import OrderRejectedBeforeDebit, OrderService, PlayerBlocked, PriceChanged
 from bot.repo import InsufficientFunds, Repo, utcnow
 from bot.security import DecryptionError
@@ -239,3 +239,70 @@ async def test_blocked_player_id_is_not_stored_in_plain_text(env):
     await env.repo.block_player("5123456789", owner_id=1)
     assert "5123456789" not in repr(env.store.data["blocked_players"])
     assert await env.repo.is_player_blocked("٥١٢٣٤٥٦٧٨٩")  # Arabic digits match too
+
+
+
+def _new_orders(env):
+    return [r for r in env.fake.requests if "/newOrder/" in r.url.path]
+
+
+async def test_unknown_order_found_by_check_is_not_resent(env):
+    env.fake.behaviours.append("network_after_create")
+    res = await env.place()
+    assert await env.svc.reconcile() == 1
+    assert (await env.repo.get_order(res.order.uuid)).status == "accept"
+    assert len(_new_orders(env)) == 1  # resolved by the check, no second newOrder
+
+
+async def test_retry_error_never_refunds_and_alerts_owner(env):
+    # First request lost before reaching the provider, then every retry is refused
+    # (e.g. maintenance). The bot can't prove the order was never made: no refund.
+    env.fake.behaviours.extend(["network"] + [("error", 130)] * 10)
+    res = await env.place()
+    assert res.order.status == "unknown"
+    for _ in range(4):
+        assert await env.svc.reconcile() == 0
+    order = await env.repo.get_order(res.order.uuid)
+    assert order.status == "unknown" and order.attempts == 5
+    assert order.last_error == "api_130"
+    assert await env.balance() == Decimal("8.79")  # still charged
+    assert env.notified == []
+    assert len(env.alerts) == 1 and "غير معروفة" in env.alerts[0]
+    assert order.uuid in env.alerts[0]
+
+    # The owner checks the provider panel and refunds by hand.
+    refunded = await env.svc.owner_refund(order.uuid)
+    assert refunded.status == "reject"
+    assert await env.balance() == Decimal("10")
+
+
+async def test_check_failure_keeps_order_unknown(env, monkeypatch):
+    env.fake.behaviours.append("network_after_create")
+    res = await env.place()
+
+    async def down(uuids):
+        raise G4SUnavailable("down")
+
+    monkeypatch.setattr(env.api, "check_by_uuid", down)
+    assert await env.svc.reconcile() == 0
+    order = await env.repo.get_order(res.order.uuid)
+    assert order.status == "unknown" and order.last_error == "check_network"
+    assert order.attempts == 2
+    assert len(_new_orders(env)) == 1  # not re-sent while the check is down
+    assert await env.balance() == Decimal("8.79")
+
+
+async def test_provider_reject_found_by_check_refunds(env):
+    env.fake.behaviours.append("network_after_create")
+    res = await env.place()
+    env.fake.orders[res.order.uuid]["status"] = "reject"
+    assert await env.svc.reconcile() == 1
+    assert await env.balance() == Decimal("10")
+    assert await env.svc.reconcile() == 0
+    assert len(env.notified) == 1
+
+
+async def test_order_keeps_the_field_labels(env):
+    res = await env.place()
+    assert res.order.labels == ["ادخل الايدي الاعب"]
+    assert res.order.params == {"playerId": "PLAYER-ZX81Q"}

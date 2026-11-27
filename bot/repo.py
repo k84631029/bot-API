@@ -80,6 +80,7 @@ class Order:
     amount: Decimal
     cost: Decimal
     params: dict[str, str]
+    labels: list[str]  # what the customer was asked for each param, same order
     provider_order_id: str | None
     provider_price: str | None
     replay: Any
@@ -244,6 +245,7 @@ class Repo:
             amount=to_decimal(self._dec(ORDERS, ouuid, "amount", d.get("amount_enc"), "0")),
             cost=to_decimal(self._dec(ORDERS, ouuid, "cost", d.get("cost_enc"), "0")),
             params=json.loads(self._dec(ORDERS, ouuid, "params", d.get("params_enc"), "{}")),
+            labels=[str(x) for x in d.get("param_labels") or []],
             provider_order_id=d.get("provider_order_id"),
             provider_price=self._dec(ORDERS, ouuid, "provider_price", d.get("provider_price_enc")) or None,
             replay=json.loads(replay_raw),
@@ -255,7 +257,8 @@ class Repo:
 
     async def create_order_with_debit(self, telegram_id: int, order_uuid: str, product_id: int,
                                       product_name: str, qty: int, amount: Decimal, cost: Decimal,
-                                      params: dict[str, str]) -> tuple[Order, bool]:
+                                      params: dict[str, str],
+                                      labels: list[str] | None = None) -> tuple[Order, bool]:
         """Atomically debit the wallet and create the order.
 
         Idempotent on order_uuid: a second call (double tap, retry) returns the
@@ -289,6 +292,7 @@ class Repo:
                 "qty": qty,
                 "amount_enc": self._enc(ORDERS, order_uuid, "amount", str(amount)),
                 "cost_enc": self._enc(ORDERS, order_uuid, "cost", str(cost)),
+                "param_labels": list(labels or []),
                 "params_enc": self._enc(ORDERS, order_uuid, "params",
                                         json.dumps(params, ensure_ascii=False)),
                 "provider_order_id": None,

@@ -108,11 +108,18 @@ def order_text(order: Order, s: Services, detailed: bool = False) -> str:
         f"التاريخ: {when(order.created_at)}",
     ]
     if detailed:
-        for key, value in order.params.items():
-            lines.append(f"{esc(key)}: <code>{esc(value)}</code>")
+        for i, (key, value) in enumerate(order.params.items()):
+            lines.append(f"{esc(param_label(order, i, key))}: <code>{esc(value)}</code>")
         if order.status == "accept" and order.replay:
             lines.append(f"الرد: <code>{esc(_flatten(order.replay))}</code>")
     return "\n".join(lines)
+
+
+def param_label(order: Order, index: int, key: str) -> str:
+    """The field name the customer saw (e.g. "PLAYER ID"), not the API key."""
+    if index < len(order.labels) and order.labels[index].strip():
+        return order.labels[index].strip().rstrip(":：").strip()
+    return "PLAYER ID" if key == "playerId" else key  # orders made before labels were saved
 
 
 def _flatten(replay) -> str:

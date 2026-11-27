@@ -6,9 +6,18 @@
                wait    ─► poller checks by uuid until accept/reject
                reject / API error ─► automatic refund
                network error / timeout ─► status "unknown": NO refund.
-                    The poller re-sends newOrder with the SAME order_uuid; the
-                    provider returns the original order if it exists, so this is
-                    safe and resolves the uncertainty.
+
+  Recovering an "unknown" order (poller, every minute):
+    1. ask the provider about the uuid (check?uuid=1)
+         found      ─► take its status (accept / reject / wait)
+    2. not found    ─► re-send newOrder with the SAME uuid (it cannot duplicate)
+    3. any error on the check or the re-send ─► stay "unknown", NEVER refund.
+       The original request may have gone through even if the retry is refused
+       (maintenance, low provider balance, product now unavailable...).
+       The owner is alerted and decides with the manual refund button.
+
+Only the FIRST submission may refund automatically on an API error, because
+then the provider answered that very request and did not create the order.
 """
 from __future__ import annotations
 
@@ -28,7 +37,10 @@ log = logging.getLogger(__name__)
 # A "processing" order older than this was interrupted (crash/restart) between
 # the debit and the API reply, and is treated like "unknown".
 STALE_PROCESSING = timedelta(minutes=3)
+# Alert the owner after this many failed recovery attempts (one per minute),
+# then again every REALERT_EVERY attempts while the order stays unresolved.
 ALERT_AFTER_ATTEMPTS = 5
+REALERT_EVERY = 60
 
 
 class OrderRejectedBeforeDebit(Exception):
@@ -112,7 +124,7 @@ class OrderService:
         # Raises InsufficientFunds / UserBanned with nothing charged.
         order, created = await self.repo.create_order_with_debit(
             telegram_id, order_uuid, product.id, product.name, qty, total,
-            product.price * qty, api_params(product, values))
+            product.price * qty, api_params(product, values), labels=list(product.params))
         if not created:
             return PlaceResult(order, duplicate=True)
         await self.repo.log_user(telegram_id, "order_created", f"{order_uuid} {product.name} x{qty}")
@@ -129,26 +141,61 @@ class OrderService:
             return PlaceResult(final or await self.repo.get_order(order.uuid), error_code=exc.code)
         except G4SUnavailable as exc:
             log.warning("Order %s outcome unknown: %s", order.uuid, exc)
-            await self.repo.mark_open(order.uuid, "unknown", error="network", count_attempt=True)
-            current = await self.repo.get_order(order.uuid)
-            if current and current.attempts == ALERT_AFTER_ATTEMPTS:
-                await self.alert_owner(
-                    f"⚠️ الطلب {order.uuid} حالته غير معروفة بعد {current.attempts} محاولات. "
-                    "راجع لوحة game4station.")
-            return PlaceResult(current)
-        updated = await self._apply(order.uuid, res)
+            return PlaceResult(await self._still_unknown(order, "network"))
+        updated, _ = await self._apply(order.uuid, res)
         return PlaceResult(updated)
 
-    async def _apply(self, order_uuid: str, res: OrderResult) -> Order:
+    async def _recover(self, order: Order) -> tuple[Order | None, bool]:
+        """Resolve an order whose outcome is unknown. Never refunds on its own;
+        only a provider status of "reject" (from check or re-send) refunds."""
+        try:
+            found = await self.api.check_by_uuid([order.uuid])
+        except G4SError as exc:
+            return await self._still_unknown(order, f"check_{exc.code}"), False
+        except G4SUnavailable:
+            return await self._still_unknown(order, "check_network"), False
+        res = found.get(order.uuid)
+        if res is None:
+            # The provider has no record of it: re-send the same uuid.
+            try:
+                res = await self.api.new_order(order.product_id, order.qty, order.uuid,
+                                               order.params)
+            except G4SError as exc:
+                return await self._still_unknown(order, f"api_{exc.code}"), False
+            except G4SUnavailable:
+                return await self._still_unknown(order, "network"), False
+        return await self._apply(order.uuid, res)
+
+    async def _still_unknown(self, order: Order, error: str) -> Order | None:
+        await self.repo.mark_open(order.uuid, "unknown", error=error, count_attempt=True)
+        current = await self.repo.get_order(order.uuid)
+        if current and (current.attempts == ALERT_AFTER_ATTEMPTS or (
+                current.attempts > ALERT_AFTER_ATTEMPTS
+                and (current.attempts - ALERT_AFTER_ATTEMPTS) % REALERT_EVERY == 0)):
+            await self.alert_owner(
+                "⚠️ طلب حالته غير معروفة\n"
+                f"المنتج: {current.product_name} × {current.qty}\n"
+                f"رقم الطلب: {current.uuid}\n"
+                f"المحاولات: {current.attempts} | آخر خطأ: {error}\n\n"
+                "البوت ما رجّع المبلغ للعميل. شيك في لوحة game4station:\n"
+                "• إذا الطلب ما وصل: لوحة المالك ← 📋 الطلبات المعلّقة ← الطلب ← ↩️ استرجاع\n"
+                "• إذا وصل: اتركه، والبوت يكمّل المحاولة")
+        return current
+
+    async def _apply(self, order_uuid: str, res: OrderResult) -> tuple[Order | None, bool]:
+        """Record the provider's status. Returns (order, changed): `changed` is
+        True only if this call moved the order to a final status."""
         if res.status == "wait":
             await self.repo.mark_open(order_uuid, "wait", provider_order_id=res.provider_order_id)
-            return await self.repo.get_order(order_uuid)
+            return await self.repo.get_order(order_uuid), False
         final = await self.repo.finalize(order_uuid, res.status, provider_order_id=res.provider_order_id,
                                          provider_price=res.price, replay=res.replay)
         if final and res.price is not None and res.price > final.cost:
             log.warning("Order %s provider price %s above expected cost %s",
                         order_uuid, res.price, final.cost)
-        return final or await self.repo.get_order(order_uuid)
+        if final is None:  # already final (e.g. the owner refunded it meanwhile)
+            return await self.repo.get_order(order_uuid), False
+        return final, True
 
     async def reconcile(self) -> int:
         """Resolve open orders. Called periodically. Returns how many finished."""
@@ -165,17 +212,17 @@ class OrderService:
                     res = found.get(order.uuid)
                     if res is None or res.status == "wait":
                         continue
-                    updated = await self._apply(order.uuid, res)
+                    updated, changed = await self._apply(order.uuid, res)
                 elif order.status == "unknown" or (
                         order.status == "processing" and order.updated_at
                         and now - order.updated_at > STALE_PROCESSING):
-                    updated = (await self._submit(order)).order
+                    updated, changed = await self._recover(order)
                 else:
                     continue
             except (G4SError, G4SUnavailable) as exc:
                 log.warning("Reconcile %s failed: %s", order.uuid, exc)
                 continue
-            if updated and updated.is_final:
+            if changed and updated and updated.is_final:
                 finished += 1
                 await self.notify_user(updated)
         return finished

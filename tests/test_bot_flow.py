@@ -435,3 +435,17 @@ async def test_customer_cannot_manage_blocklist(h):
     await h.press(CUSTOMER, f"a:bu:{tag}")
     assert await h.svc.repo.is_player_blocked("555")
     assert not await h.svc.repo.is_player_blocked("123")
+
+
+
+async def test_order_messages_show_the_label_the_customer_saw(h):
+    await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 10")
+    await h.press(CUSTOMER, "p:18")
+    await h.text(CUSTOMER, "5123456789")
+    confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("o:"))
+    await h.press(CUSTOMER, confirm["callback_data"])
+    text = h.tg.last_text(CUSTOMER)
+    assert "تم تنفيذ طلبك بنجاح" in text
+    assert "ادخل الايدي الاعب: <code>5123456789</code>" in text
+    assert "playerId" not in text
