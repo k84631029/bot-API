@@ -31,6 +31,7 @@ class Store(Protocol):
     async def get(self, collection: str, doc_id: str) -> dict | None: ...
     async def set(self, collection: str, doc_id: str, data: dict) -> None: ...
     async def merge(self, collection: str, doc_id: str, data: dict) -> None: ...
+    async def delete(self, collection: str, doc_id: str) -> None: ...
     async def query(self, collection: str, filters: Iterable[Filter] = (),
                     order_by: str | None = None, descending: bool = False,
                     limit: int | None = None) -> list[tuple[str, dict]]: ...
@@ -99,6 +100,9 @@ class FirestoreStore:
 
     async def merge(self, collection, doc_id, data):
         await self._db.collection(collection).document(doc_id).set(data, merge=True)
+
+    async def delete(self, collection, doc_id):
+        await self._db.collection(collection).document(doc_id).delete()
 
     async def query(self, collection, filters=(), order_by=None, descending=False, limit=None):
         from google.cloud.firestore_v1.base_query import FieldFilter
@@ -179,6 +183,10 @@ class MemoryStore:
     async def merge(self, collection, doc_id, data):
         async with self._lock:
             self._apply("merge", collection, doc_id, copy.deepcopy(data))
+
+    async def delete(self, collection, doc_id):
+        async with self._lock:
+            self.data.get(collection, {}).pop(doc_id, None)
 
     async def query(self, collection, filters=(), order_by=None, descending=False, limit=None):
         rows = [

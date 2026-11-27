@@ -90,3 +90,7 @@ class Crypto:
     # -- hashing ----------------------------------------------------------
     def user_hash(self, telegram_id: int) -> str:
         return hmac.new(self._hmac_key, f"tg:{telegram_id}".encode(), hashlib.sha256).hexdigest()
+
+    def tag(self, namespace: str, value: str) -> str:
+        """Keyed hash of any value, for lookups that must not reveal the value."""
+        return hmac.new(self._hmac_key, f"{namespace}:{value}".encode(), hashlib.sha256).hexdigest()

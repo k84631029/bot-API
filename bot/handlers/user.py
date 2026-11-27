@@ -10,7 +10,7 @@ from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from ..g4s import G4SError, G4SUnavailable, Product
 from ..money import to_decimal
-from ..orders import OrderRejectedBeforeDebit, PriceChanged
+from ..orders import PLAYER_BLOCKED_TEXT, OrderRejectedBeforeDebit, PlayerBlocked, PriceChanged
 from ..repo import InsufficientFunds, UserBanned
 from . import owner
 from .common import (BTN_BALANCE, BTN_LEDGER, BTN_ORDERS, BTN_PRODUCTS, BTN_TOPUP, LEDGER_LABELS,
@@ -309,6 +309,10 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if not text or len(text) > MAX_PARAM_LEN or "\n" in text:
             await reply(update, f"قيمة غير صالحة (بحد أقصى {MAX_PARAM_LEN} حرف وسطر واحد).")
             return
+        if await s.repo.is_player_blocked(text):
+            context.user_data.pop("draft", None)
+            await _player_blocked(update, context, text, p.name)
+            return
         draft["values"].append(text)
         await _next_step(update, context, p)
         return
@@ -371,6 +375,11 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await reply(update, f"رصيدك ما يكفي.\nرصيدك: {s.money(exc.balance)}\n"
                             f"المطلوب: {s.money(exc.needed)}\nاضغط «➕ شحن الرصيد».")
         return
+    except PlayerBlocked as exc:
+        context.user_data.pop("draft", None)
+        p = await s.catalog.product(draft["product_id"])
+        await _player_blocked(update, context, exc.value, p.name if p else "")
+        return
     except OrderRejectedBeforeDebit as exc:
         context.user_data.pop("draft", None)
         await reply(update, f"تعذّر تنفيذ الطلب: {esc(exc)}")
@@ -388,3 +397,15 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await reply(update, "❌ الطلب انرفض، ورجع المبلغ لمحفظتك.\n\n" + order_text(order, s))
     else:
         await reply(update, "⏳ طلبك قيد التنفيذ، بنرسل لك أول ما يكتمل.\n\n" + order_text(order, s))
+
+
+async def _player_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE, player_id: str,
+                          product_name: str) -> None:
+    """Customer entered a blocked player ID: cancel, tell them, and warn the owner."""
+    s = svc(context)
+    tg_id = update.effective_user.id
+    await reply(update, PLAYER_BLOCKED_TEXT)
+    await s.repo.log_user(tg_id, "blocked_player_attempt", f"{player_id} {product_name}")
+    await s.orders.alert_owner(
+        "⚠️ عميل حاول يشحن لآيدي محظور\n"
+        f"العميل: {tg_id}\nالآيدي: {player_id}\nالمنتج: {product_name}")

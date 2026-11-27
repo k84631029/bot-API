@@ -63,7 +63,7 @@ def _panel_markup(maintenance: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardButton
     return InlineKeyboardMarkup([
         [b("💰 شحن رصيد عميل", callback_data="a:cr"), b("➖ خصم من عميل", callback_data="a:db")],
-        [b("👤 إدارة عميل", callback_data="a:us")],
+        [b("👤 إدارة عميل", callback_data="a:us"), b("🚫 آيديات محظورة", callback_data="a:bl")],
         [b("🧩 المنتجات المعروضة", callback_data="a:pv:0"), b("📈 نسبة الربح", callback_data="a:mg")],
         [b("📋 الطلبات المعلّقة", callback_data="a:open"), b("🔍 بحث عن طلب", callback_data="a:od")],
         [b("💳 رصيدي عند المزود", callback_data="a:bal"),
@@ -331,11 +331,15 @@ async def _order_card(update: Update, context: ContextTypes.DEFAULT_TYPE, order_
              f"\nتكلفة متوقعة: {order.cost} | سعر المزود: {order.provider_price or '-'}"
              f"\nرقم المزود: {esc(order.provider_order_id or '-')}"
              f"\nمحاولات: {order.attempts} | آخر خطأ: {esc(order.last_error or '-')}")
-    markup = None
+    rows = []
     if not order.is_final:
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton(
-            "↩️ استرجاع المبلغ للعميل", callback_data=f"a:rq:{order.uuid}")]])
-    await reply(update, order_text(order, s, detailed=True) + extra, reply_markup=markup)
+        rows.append([InlineKeyboardButton(
+            "↩️ استرجاع المبلغ للعميل", callback_data=f"a:rq:{order.uuid}")])
+    if _order_player_id(order):
+        rows.append([InlineKeyboardButton(
+            "🚫 حظر آيدي اللاعب هذا", callback_data=f"a:bo:{order.uuid}")])
+    await reply(update, order_text(order, s, detailed=True) + extra,
+                reply_markup=InlineKeyboardMarkup(rows) if rows else None)
 
 
 @owner_only
@@ -636,6 +640,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         await _set_margin(update, context, value)
         return True
 
+    if kind == "block_player":
+        if not text or len(text) > 120 or "\n" in text:
+            await reply(update, "آيدي غير صالح. أرسله في سطر واحد (حد أقصى 120 حرف):",
+                        reply_markup=CANCEL_MARKUP)
+            return True
+        _clear_step(context)
+        await _block(update, context, text)
+        await _blocked_list(update, context, edit=False)
+        return True
+
     if kind == "order":
         if not UUID_RE.match(text):
             await reply(update, "رقم الطلب غير صالح. انسخه كامل من رسالة الطلب:",
@@ -833,4 +847,82 @@ _BUTTONS = {
     "oi": _btn_order_info,
     "rq": _btn_refund_prompt,
     "rc": _btn_recheck,
+    "bl": lambda u, c, a: _blocked_list(u, c, edit=False),
+    "ba": lambda u, c, a: _btn_block_ask(u, c),
+    "bu": lambda u, c, a: _btn_unblock(u, c, a),
+    "bo": lambda u, c, a: _btn_block_from_order(u, c, a),
 }
+
+
+
+# ---------------------------------------------------------------------------
+# Blocked player IDs (the in-game ID a customer types when ordering)
+# ---------------------------------------------------------------------------
+BLOCK_TAG_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _order_player_id(order) -> str:
+    """The player ID of an order: `playerId`, else the first value entered."""
+    return order.params.get("playerId") or next(iter(order.params.values()), "")
+
+
+async def _block(update: Update, context: ContextTypes.DEFAULT_TYPE, player_id: str) -> None:
+    s = svc(context)
+    created = await s.repo.block_player(player_id, update.effective_user.id)
+    if created:
+        await _audit(context, update, "player_block", player_id)
+        await reply(update, f"✅ تم حظر الآيدي <code>{esc(player_id)}</code>.\n"
+                            "أي طلب عليه ينرفض قبل الخصم، ويوصلك تنبيه.")
+    else:
+        await reply(update, f"الآيدي <code>{esc(player_id)}</code> محظور من قبل.")
+
+
+async def _blocked_list(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool) -> None:
+    s = svc(context)
+    entries = await s.repo.blocked_players(limit=30)
+    rows = [[InlineKeyboardButton("➕ حظر آيدي", callback_data="a:ba")]]
+    rows += [[InlineKeyboardButton(f"✅ فك حظر {value[:40]}", callback_data=f"a:bu:{tag}")]
+             for tag, value, _ in entries]
+    rows.append([InlineKeyboardButton("🔙 لوحة المالك", callback_data="a:home")])
+    if entries:
+        lines = ["🚫 <b>آيديات اللاعبين المحظورة</b>", ""]
+        lines += [f"• <code>{esc(value)}</code> — {when(at)}" for _, value, at in entries]
+        if len(entries) == 30:
+            lines.append("\n(يعرض آخر 30)")
+        lines.append("\nاضغط «فك حظر» عشان ترجّع الآيدي مسموح.")
+    else:
+        lines = ["🚫 <b>آيديات اللاعبين المحظورة</b>", "", "ما فيه آيديات محظورة."]
+    text = "\n".join(lines)
+    markup = InlineKeyboardMarkup(rows)
+    if edit:
+        await _edit_or_reply(update, text, markup)
+    else:
+        await reply(update, text, reply_markup=markup)
+
+
+async def _btn_block_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _set_step(context, "block_player")
+    await reply(update, "🚫 أرسل آيدي اللاعب اللي تبي تحظره:", reply_markup=CANCEL_MARKUP)
+
+
+async def _btn_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE, tag: str) -> None:
+    if not BLOCK_TAG_RE.match(tag):
+        return
+    s = svc(context)
+    value = await s.repo.unblock_player(tag)
+    if value is not None:
+        await _audit(context, update, "player_unblock", value)
+    await _blocked_list(update, context, edit=True)
+
+
+async def _btn_block_from_order(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                order_uuid: str) -> None:
+    if not UUID_RE.match(order_uuid):
+        return
+    s = svc(context)
+    order = await s.repo.get_order(order_uuid)
+    player_id = _order_player_id(order) if order else ""
+    if not player_id:
+        await reply(update, "ما لقيت آيدي لاعب في هذا الطلب.")
+        return
+    await _block(update, context, player_id)

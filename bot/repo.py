@@ -10,7 +10,8 @@ Collections:
   ledger/{entry_id}         wallet movements (kept, no TTL)
   logs/{id}                 user activity (expire_at -> Firestore TTL policy)
   owner_logs/{id}           owner actions
-  settings/global           maintenance flag, margin
+  settings/global           maintenance flag, margin, visible products
+  blocked_players/{tag}     player IDs nobody may top up (value encrypted)
 """
 from __future__ import annotations
 
@@ -24,8 +25,14 @@ from .money import ZERO, to_decimal
 from .security import Crypto
 from .store import Store, Tx, new_id
 
-USERS, ORDERS, LEDGER, LOGS, OWNER_LOGS, SETTINGS = (
-    "users", "orders", "ledger", "logs", "owner_logs", "settings")
+USERS, ORDERS, LEDGER, LOGS, OWNER_LOGS, SETTINGS, BLOCKED = (
+    "users", "orders", "ledger", "logs", "owner_logs", "settings", "blocked_players")
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def normalize_player_id(value: str) -> str:
+    """Same player ID however it was typed: no spaces, Western digits, lowercase."""
+    return "".join(str(value).split()).translate(_AR_DIGITS).lower()
 
 OPEN_STATUSES = ("processing", "wait", "unknown")
 FINAL_STATUSES = ("accept", "reject")
@@ -427,3 +434,51 @@ class Repo:
             return frozenset(current)
 
         return await self.store.run_transaction(fn)
+
+
+    # -- blocked player IDs ---------------------------------------------------
+    def _player_tag(self, value: str) -> str:
+        # 32 hex chars keeps the ID short enough for Telegram button data.
+        return self.crypto.tag("player", normalize_player_id(value))[:32]
+
+    async def block_player(self, value: str, owner_id: int) -> bool:
+        """Block a player ID. Returns False if it was already blocked."""
+        tag = self._player_tag(value)
+        if not normalize_player_id(value):
+            raise ValueError("empty player id")
+
+        async def fn(tx: Tx):
+            if await tx.get(BLOCKED, tag) is not None:
+                return False
+            tx.set(BLOCKED, tag, {
+                "value_enc": self._enc(BLOCKED, tag, "value", value.strip()),
+                "by": self.user_hash(owner_id),
+                "created_at": utcnow(),
+            })
+            return True
+
+        return await self.store.run_transaction(fn)
+
+    async def unblock_player(self, tag: str) -> str | None:
+        """Remove a block by its tag. Returns the player ID, or None if not found."""
+        doc = await self.store.get(BLOCKED, tag)
+        if doc is None:
+            return None
+        await self.store.delete(BLOCKED, tag)
+        return self._dec(BLOCKED, tag, "value", doc.get("value_enc"))
+
+    async def is_player_blocked(self, value: str) -> bool:
+        if not normalize_player_id(value):
+            return False
+        return await self.store.get(BLOCKED, self._player_tag(value)) is not None
+
+    async def first_blocked(self, values) -> str | None:
+        for value in values:
+            if await self.is_player_blocked(value):
+                return value
+        return None
+
+    async def blocked_players(self, limit: int = 30) -> list[tuple[str, str, datetime | None]]:
+        rows = await self.store.query(BLOCKED, order_by="created_at", descending=True, limit=limit)
+        return [(tag, self._dec(BLOCKED, tag, "value", d.get("value_enc")), d.get("created_at"))
+                for tag, d in rows]

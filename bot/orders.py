@@ -35,6 +35,17 @@ class OrderRejectedBeforeDebit(Exception):
     """Validation failed; nothing was charged."""
 
 
+PLAYER_BLOCKED_TEXT = "🚫 هذا الآيدي محظور أو نصاب، وتم إلغاء طلبك."
+
+
+class PlayerBlocked(OrderRejectedBeforeDebit):
+    """The player ID is on the owner's block list; nothing was charged."""
+
+    def __init__(self, value: str):
+        super().__init__(PLAYER_BLOCKED_TEXT)
+        self.value = value
+
+
 @dataclass
 class PriceChanged(Exception):
     new_total: Decimal
@@ -80,6 +91,8 @@ class OrderService:
 
         if not await self.runtime.is_visible(product_id):
             raise OrderRejectedBeforeDebit("المنتج غير متوفر حالياً")
+        if (blocked := await self.repo.first_blocked(values)) is not None:
+            raise PlayerBlocked(blocked)
         try:
             product = await self.catalog.fresh_product(product_id)
         except (G4SError, G4SUnavailable) as exc:

@@ -365,3 +365,73 @@ async def test_customer_cannot_use_owner_buttons(h):
     assert all("آيدي العميل" not in t and "تأكيد" not in t for t in sent)
     assert await h.svc.runtime.margin() == Decimal("10")
     assert not (await h.svc.repo.get_user(CUSTOMER)).banned
+
+
+async def test_owner_blocks_player_and_customer_is_refused(h):
+    await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 10")
+    await h.press(OWNER, "a:bl")
+    assert "ما فيه آيديات محظورة" in h.tg.last_text(OWNER)
+    await h.press(OWNER, "a:ba")
+    await h.text(OWNER, "5123456789")
+    assert any("تم حظر الآيدي" in p["text"] for p in h.tg.sent(OWNER)[-2:])
+    assert "5123456789" in h.tg.last_text(OWNER)  # shown in the list
+
+    await h.press(CUSTOMER, "p:18")
+    await h.text(CUSTOMER, "5123456789")
+    assert h.tg.last_text(CUSTOMER) == "🚫 هذا الآيدي محظور أو نصاب، وتم إلغاء طلبك."
+    assert "آيدي محظور" in h.tg.last_text(OWNER)  # owner alerted
+    await h.text(CUSTOMER, "1")  # draft is gone: nothing continues
+    assert "اختر من القائمة" in h.tg.last_text(CUSTOMER)
+    assert h.g4s.orders == {}
+    assert (await h.svc.repo.get_user(CUSTOMER)).balance == Decimal("10.00")
+
+    await h.press(OWNER, "a:bl")
+    unblock = next(b for b in h.tg.last_buttons(OWNER) if b["callback_data"].startswith("a:bu:"))
+    await h.press(OWNER, unblock["callback_data"])
+    assert not await h.svc.repo.is_player_blocked("5123456789")
+    await h.press(CUSTOMER, "p:18")
+    await h.text(CUSTOMER, "5123456789")
+    assert "تأكيد الطلب" in h.tg.last_text(CUSTOMER)
+    logs = [a for _, _, a, _ in await h.svc.repo.owner_logs()]
+    assert "player_block" in logs and "player_unblock" in logs
+
+
+async def test_block_between_entering_id_and_confirming(h):
+    await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 10")
+    await h.press(CUSTOMER, "p:18")
+    await h.text(CUSTOMER, "777")
+    confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("o:"))
+    await h.svc.repo.block_player("777", OWNER)
+    await h.press(CUSTOMER, confirm["callback_data"])
+    assert h.tg.last_text(CUSTOMER) == "🚫 هذا الآيدي محظور أو نصاب، وتم إلغاء طلبك."
+    assert h.g4s.orders == {}
+    assert (await h.svc.repo.get_user(CUSTOMER)).balance == Decimal("10.00")
+
+
+async def test_block_player_from_order_card(h):
+    await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 10")
+    await h.press(CUSTOMER, "p:18")
+    await h.text(CUSTOMER, "999888")
+    confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("o:"))
+    await h.press(CUSTOMER, confirm["callback_data"])
+    order_uuid = next(iter(h.g4s.orders))
+
+    await h.press(OWNER, f"a:oi:{order_uuid}")
+    assert any(b["callback_data"] == f"a:bo:{order_uuid}" for b in h.tg.last_buttons(OWNER))
+    await h.press(OWNER, f"a:bo:{order_uuid}")
+    assert "تم حظر الآيدي" in h.tg.last_text(OWNER)
+    assert await h.svc.repo.is_player_blocked("999888")
+
+
+async def test_customer_cannot_manage_blocklist(h):
+    await h.svc.repo.block_player("555", OWNER)
+    [(tag, _, _)] = await h.svc.repo.blocked_players()
+    await h.text(CUSTOMER, "/start")
+    await h.press(CUSTOMER, "a:ba")
+    await h.text(CUSTOMER, "123")
+    await h.press(CUSTOMER, f"a:bu:{tag}")
+    assert await h.svc.repo.is_player_blocked("555")
+    assert not await h.svc.repo.is_player_blocked("123")

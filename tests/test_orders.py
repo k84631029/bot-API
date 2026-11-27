@@ -6,7 +6,7 @@ import pytest
 
 from bot.catalog import Catalog, RuntimeSettings
 from bot.g4s import G4SClient
-from bot.orders import OrderRejectedBeforeDebit, OrderService, PriceChanged
+from bot.orders import OrderRejectedBeforeDebit, OrderService, PlayerBlocked, PriceChanged
 from bot.repo import InsufficientFunds, Repo, utcnow
 from bot.security import DecryptionError
 from bot.store import MemoryStore
@@ -216,3 +216,26 @@ async def test_visibility_toggles_are_merged(env):
     assert await env.repo.set_products_visible([18], True) == frozenset({18})
     assert await env.repo.set_products_visible([365], True) == frozenset({18, 365})
     assert await env.repo.set_products_visible([18], False) == frozenset({365})
+
+
+async def test_blocked_player_cannot_order(env):
+    assert await env.repo.block_player(" player-zx81q ", owner_id=1)  # spaces/case ignored
+    assert not await env.repo.block_player("PLAYER-ZX81Q", owner_id=1)  # already blocked
+    with pytest.raises(PlayerBlocked) as info:
+        await env.place()
+    assert "محظور أو نصاب" in str(info.value)
+    assert await env.balance() == Decimal("10")
+    assert env.fake.orders == {}
+
+    [(tag, value, _)] = await env.repo.blocked_players()
+    assert value == "player-zx81q"
+    assert await env.repo.unblock_player(tag) == "player-zx81q"
+    assert await env.repo.blocked_players() == []
+    res = await env.place()
+    assert res.order.status == "accept"
+
+
+async def test_blocked_player_id_is_not_stored_in_plain_text(env):
+    await env.repo.block_player("5123456789", owner_id=1)
+    assert "5123456789" not in repr(env.store.data["blocked_players"])
+    assert await env.repo.is_player_blocked("٥١٢٣٤٥٦٧٨٩")  # Arabic digits match too
