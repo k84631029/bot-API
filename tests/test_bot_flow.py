@@ -584,7 +584,7 @@ async def test_disabled_buttons_fall_back_if_telegram_refuses(h, monkeypatch):
 async def test_inline_main_menu(h):
     await h.text(CUSTOMER, "/start")
     menu = [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)]
-    assert menu == ["m:shop", "m:bal", "m:top", "m:ord", "m:led"]
+    assert menu == ["m:shop", "m:bal", "m:top", "m:acc"]
 
     def home_in_last():
         return any(b["callback_data"] == "m:home" for b in h.tg.last_buttons(CUSTOMER))
@@ -637,3 +637,23 @@ async def test_locked_products_offer_topup_and_order_screens_go_home(h):
     await h.press(CUSTOMER, f"od:{order_uuid}")
     data = [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)]
     assert data == ["m:ord", "m:home"]
+
+
+
+async def test_account_screen(h):
+    await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 5")
+    await h.press(CUSTOMER, "m:acc")
+    text = h.tg.last_text(CUSTOMER)
+    assert "حسابي" in text and f"🆔: <code>{CUSTOMER}</code>" in text and "5.00" in text
+    data = [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)]
+    assert data == ["m:ord", "m:led", "m:xfer", "m:home"]
+
+    await h.press(CUSTOMER, "m:xfer")
+    assert "قريباً" in h.tg.alerts()[-1]["text"]
+
+    await h.press(CUSTOMER, "m:led")
+    assert "آخر العمليات" in h.tg.last_text(CUSTOMER)
+    assert [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)] == ["m:acc", "m:home"]
+    await h.press(CUSTOMER, "m:ord")
+    assert [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)][-2:] == ["m:acc", "m:home"]

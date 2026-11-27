@@ -24,6 +24,8 @@ BTN_ORDERS = "📦 طلباتي"
 BTN_LEDGER = "🧾 سجل المحفظة"
 BTN_TOPUP = "➕ شحن الرصيد"
 BTN_ADMIN = "🛠 لوحة المالك"
+BTN_ACCOUNT = "👤 حسابي"
+BTN_TRANSFER = "🔄 تحويل لصديق (قريباً)"
 # What customers see for the first field of every product (the player ID),
 # whatever name the provider gives it.
 PLAYER_ID_LABEL = "ايدي الشحن"
@@ -93,6 +95,8 @@ def bottom_keyboard(is_owner: bool) -> ReplyKeyboardMarkup | ReplyKeyboardRemove
 
 # Inline main menu (callback data "m:<item>").
 HOME_ROW = [InlineKeyboardButton("🏠 القائمة", callback_data="m:home")]
+# Under screens opened from "👤 حسابي": back to the account, or home.
+ACCOUNT_ROW = [InlineKeyboardButton("🔙 حسابي", callback_data="m:acc"), *HOME_ROW]
 TOPUP_BUTTON = InlineKeyboardButton(BTN_TOPUP, callback_data="m:top")
 def menu_text(user, back: bool = False) -> str:
     """Main menu text. back=True when returning to it with "🏠 القائمة"."""
@@ -107,7 +111,7 @@ def menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [b(BTN_PRODUCTS, callback_data="m:shop")],
         [b(BTN_BALANCE, callback_data="m:bal"), TOPUP_BUTTON],
-        [b(BTN_ORDERS, callback_data="m:ord"), b(BTN_LEDGER, callback_data="m:led")],
+        [b(BTN_ACCOUNT, callback_data="m:acc")],
     ])
 
 

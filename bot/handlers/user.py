@@ -13,7 +13,7 @@ from ..money import ZERO, to_decimal
 from ..orders import PLAYER_BLOCKED_TEXT, OrderRejectedBeforeDebit, PlayerBlocked, PriceChanged
 from ..repo import InsufficientFunds, UserBanned
 from . import owner
-from .common import (BTN_BALANCE, BTN_LEDGER, BTN_ORDERS, BTN_PRODUCTS, BTN_TOPUP, HOME_ROW,
+from .common import (ACCOUNT_ROW, BTN_ACCOUNT, BTN_TRANSFER, BTN_BALANCE, BTN_LEDGER, BTN_ORDERS, BTN_PRODUCTS, BTN_TOPUP, HOME_ROW,
                      LEDGER_LABELS, STATUS_LABELS, TOPUP_BUTTON, bottom_keyboard, esc,
                      field_label, home_markup, menu_markup, menu_text, order_text, reply, svc, when)
 
@@ -87,10 +87,15 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if item == "shop":
         await categories(update, context)
         return
+    if item == "xfer":
+        await update.callback_query.answer("🔜 التحويل لصديق قريباً إن شاء الله.", show_alert=True)
+        return
     await update.callback_query.answer()
     if item == "home":
         context.user_data.pop("draft", None)
         await _show(update, menu_text(update.effective_user, back=True), menu_markup())
+    elif item == "acc":
+        await account(update, context)
     elif item == "bal":
         await balance(update, context)
     elif item == "top":
@@ -99,6 +104,23 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await my_orders(update, context)
     elif item == "led":
         await ledger(update, context)
+
+
+async def account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    s = svc(context)
+    tg = update.effective_user
+    user = await s.repo.get_user(tg.id)
+    text = ("👤 <b>حسابي</b>\n\n"
+            f"الاسم: {esc(tg.first_name or '')}\n"
+            f"🆔: <code>{tg.id}</code>\n"
+            f"💰 رصيدك: <b>{s.money(user.balance)}</b>\n"
+            f"📅 تاريخ التسجيل: {when(user.created_at)[:10]}")
+    b = InlineKeyboardButton
+    await _show(update, text, InlineKeyboardMarkup([
+        [b(BTN_ORDERS, callback_data="m:ord"), b(BTN_LEDGER, callback_data="m:led")],
+        [b(BTN_TRANSFER, callback_data="m:xfer")],
+        HOME_ROW,
+    ]))
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -127,13 +149,13 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     orders = await s.repo.orders_for_user(update.effective_user.id, limit=10)
     if not orders:
-        await _show(update, "ما عندك طلبات للحين.",
-                    home_markup([InlineKeyboardButton(BTN_PRODUCTS, callback_data="m:shop")]))
+        await _show(update, "ما عندك طلبات للحين.", InlineKeyboardMarkup([
+            [InlineKeyboardButton(BTN_PRODUCTS, callback_data="m:shop")], ACCOUNT_ROW]))
         return
     rows = [[InlineKeyboardButton(
         f"{STATUS_LABELS.get(o.status, o.status)[:2]} {o.product_name[:28]} — {s.money(o.amount)}",
         callback_data=f"od:{o.uuid}")] for o in orders]
-    await _show(update, "📦 آخر طلباتك:", home_markup(*rows))
+    await _show(update, "📦 آخر طلباتك:", InlineKeyboardMarkup([*rows, ACCOUNT_ROW]))
 
 
 async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,14 +174,14 @@ async def ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     entries = await s.repo.ledger_for_user(update.effective_user.id, limit=10)
     if not entries:
-        await _show(update, "ما فيه عمليات على محفظتك للحين.", home_markup())
+        await _show(update, "ما فيه عمليات على محفظتك للحين.", InlineKeyboardMarkup([ACCOUNT_ROW]))
         return
     lines = ["🧾 <b>آخر العمليات</b>"]
     for e in entries:
         sign = "+" if e.amount > 0 else ""
         lines.append(f"{when(e.created_at)} | {LEDGER_LABELS.get(e.type, e.type)} | "
                      f"{sign}{s.money(e.amount)} | الرصيد: {s.money(e.balance_after)}")
-    await _show(update, "\n".join(lines), home_markup())
+    await _show(update, "\n".join(lines), InlineKeyboardMarkup([ACCOUNT_ROW]))
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +400,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Free text: either a menu button or an answer for the current draft."""
     text = (update.effective_message.text or "").strip()
     routes = {BTN_PRODUCTS: categories, BTN_BALANCE: balance, BTN_ORDERS: my_orders,
-              BTN_LEDGER: ledger, BTN_TOPUP: topup}
+              BTN_LEDGER: ledger, BTN_TOPUP: topup, BTN_ACCOUNT: account}
     if text in routes:
         context.user_data.pop("owner_step", None)  # a menu tap cancels an owner prompt
         await routes[text](update, context)
