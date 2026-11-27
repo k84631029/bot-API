@@ -118,8 +118,10 @@ async def h():
 
 async def test_full_purchase_flow(h):
     await h.text(CUSTOMER, "/start")
-    assert "أهلاً" in h.tg.last_text(CUSTOMER)
-    assert f"🆔: <code>{CUSTOMER}</code>" in h.tg.last_text(CUSTOMER)
+    greeting, menu = h.tg.sent(CUSTOMER)[-2:]
+    assert "أهلاً" in greeting["text"] and f"🆔: <code>{CUSTOMER}</code>" in greeting["text"]
+    assert greeting["reply_markup"] == {"remove_keyboard": True}  # old keyboard gone
+    assert "اختر من القائمة" in menu["text"]
 
     await h.text(OWNER, "/start")
     await h.text(OWNER, f"/credit {CUSTOMER} 10 تحويل بنكي")
@@ -223,7 +225,7 @@ async def test_customers_see_only_visible_products(h):
     await h.svc.repo.set_products_visible([365], False)
     h.svc.runtime.invalidate()
     await h.text(CUSTOMER, "🛒 المنتجات")
-    names = [b["text"] for b in h.tg.last_buttons(CUSTOMER)]
+    names = [b["text"] for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("k:")]
     assert names == ["PUBG Global ID UC"]  # category "UC 60" (only product 365) is gone
 
     await h.press(CUSTOMER, "p:365")  # old or crafted button
@@ -252,7 +254,8 @@ async def test_owner_toggles_product_visibility(h):
     assert toggle["text"].startswith("✅")
 
     await h.text(CUSTOMER, "🛒 المنتجات")
-    assert [b["text"] for b in h.tg.last_buttons(CUSTOMER)] == ["PUBG Global ID UC"]
+    assert [b["text"] for b in h.tg.last_buttons(CUSTOMER)
+            if b["callback_data"].startswith("k:")] == ["PUBG Global ID UC"]
 
     hide_all = next(b for b in h.tg.last_buttons(OWNER) if b["callback_data"].endswith(":0")
                     and b["callback_data"].startswith("a:pa:"))
@@ -573,3 +576,60 @@ async def test_disabled_buttons_fall_back_if_telegram_refuses(h, monkeypatch):
     await h.press(CUSTOMER, f"k:{key}:0")
     [locked] = [b for b in h.tg.last_buttons(CUSTOMER) if b["text"].startswith("🔒")]
     assert locked["callback_data"] == "p:18" and "disabled" not in locked
+
+
+
+async def test_inline_main_menu(h):
+    await h.text(CUSTOMER, "/start")
+    menu = [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)]
+    assert menu == ["m:shop", "m:bal", "m:top", "m:ord", "m:led"]
+
+    def home_in_last():
+        return any(b["callback_data"] == "m:home" for b in h.tg.last_buttons(CUSTOMER))
+
+    await h.press(CUSTOMER, "m:bal")
+    assert "رصيدك" in h.tg.last_text(CUSTOMER) and home_in_last()
+    assert any(b["callback_data"] == "m:top" for b in h.tg.last_buttons(CUSTOMER))
+    await h.press(CUSTOMER, "m:top")
+    assert "طرق الدفع" in h.tg.last_text(CUSTOMER) and home_in_last()
+    await h.press(CUSTOMER, "m:ord")
+    assert "ما عندك طلبات" in h.tg.last_text(CUSTOMER) and home_in_last()
+    await h.press(CUSTOMER, "m:led")
+    assert "ما فيه عمليات" in h.tg.last_text(CUSTOMER) and home_in_last()
+    await h.press(CUSTOMER, "m:shop")
+    assert "اختر القسم" in h.tg.last_text(CUSTOMER) and home_in_last()
+    await h.press(CUSTOMER, "m:home")
+    assert h.tg.last_text(CUSTOMER) == "اختر من القائمة:"
+
+    # Menu taps edit the same message instead of sending new ones.
+    names = [n for n, p in h.tg.calls if p.get("chat_id") == CUSTOMER]
+    assert names.count("editMessageText") >= 6
+
+
+async def test_owner_keeps_only_the_panel_button_below(h):
+    await h.text(OWNER, "/start")
+    greeting = h.tg.sent(OWNER)[-2]
+    assert greeting["reply_markup"]["keyboard"] == [[{"text": "🛠 لوحة المالك"}]]
+    await h.text(OWNER, "🛠 لوحة المالك")
+    assert "لوحة المالك" in h.tg.last_text(OWNER)
+
+
+async def test_locked_products_offer_topup_and_order_screens_go_home(h):
+    key = await _pubg_key(h)
+    await h.text(CUSTOMER, "/start")
+    await h.press(CUSTOMER, f"k:{key}:0")
+    data = [b.get("callback_data") for b in h.tg.last_buttons(CUSTOMER)]
+    assert "m:top" in data and "m:home" in data and "c:0" in data
+
+    await h.text(OWNER, f"/credit {CUSTOMER} 10")
+    await h.press(CUSTOMER, "p:18")
+    await h.text(CUSTOMER, "5123456789")
+    confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("o:"))
+    await h.press(CUSTOMER, confirm["callback_data"])
+    assert "تم تنفيذ طلبك بنجاح" in h.tg.last_text(CUSTOMER)
+    assert [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)] == ["m:home"]
+
+    order_uuid = next(iter(h.g4s.orders))
+    await h.press(CUSTOMER, f"od:{order_uuid}")
+    data = [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)]
+    assert data == ["m:ord", "m:home"]

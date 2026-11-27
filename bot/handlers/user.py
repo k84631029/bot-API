@@ -13,8 +13,9 @@ from ..money import ZERO, to_decimal
 from ..orders import PLAYER_BLOCKED_TEXT, OrderRejectedBeforeDebit, PlayerBlocked, PriceChanged
 from ..repo import InsufficientFunds, UserBanned
 from . import owner
-from .common import (BTN_BALANCE, BTN_LEDGER, BTN_ORDERS, BTN_PRODUCTS, BTN_TOPUP, LEDGER_LABELS,
-                     STATUS_LABELS, esc, field_label, main_keyboard, order_text, reply, svc, when)
+from .common import (BTN_BALANCE, BTN_LEDGER, BTN_ORDERS, BTN_PRODUCTS, BTN_TOPUP, HOME_ROW,
+                     LEDGER_LABELS, MENU_TEXT, STATUS_LABELS, TOPUP_BUTTON, bottom_keyboard, esc,
+                     field_label, home_markup, menu_markup, order_text, reply, svc, when)
 
 log = logging.getLogger(__name__)
 PAGE = 10
@@ -62,16 +63,39 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     context.user_data.pop("draft", None)
+    tg_id = update.effective_user.id
     name = esc(update.effective_user.first_name or "")
-    await reply(update, f"أهلاً {name} 👋\n🆔: <code>{update.effective_user.id}</code>\n\n"
-                        "اختر من القائمة تحت.",
-                reply_markup=main_keyboard(s.is_owner(update.effective_user.id)))
+    # Two messages: a message can carry either the bottom keyboard (owner button /
+    # removal of the old customer keyboard) or inline buttons, not both.
+    await reply(update, f"أهلاً {name} 👋\n🆔: <code>{tg_id}</code>",
+                reply_markup=bottom_keyboard(s.is_owner(tg_id)))
+    await reply(update, MENU_TEXT, reply_markup=menu_markup())
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline main menu buttons (m:<item>)."""
+    item = update.callback_query.data.split(":", 1)[1]
+    if item == "shop":
+        await categories(update, context)
+        return
+    await update.callback_query.answer()
+    if item == "home":
+        context.user_data.pop("draft", None)
+        await _show(update, MENU_TEXT, menu_markup())
+    elif item == "bal":
+        await balance(update, context)
+    elif item == "top":
+        await topup(update, context)
+    elif item == "ord":
+        await my_orders(update, context)
+    elif item == "led":
+        await ledger(update, context)
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     user = await s.repo.get_user(update.effective_user.id)
-    await reply(update, f"💰 رصيدك: <b>{s.money(user.balance)}</b>")
+    await _show(update, f"💰 رصيدك: <b>{s.money(user.balance)}</b>", home_markup([TOPUP_BUTTON]))
 
 
 async def topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -87,19 +111,20 @@ async def topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     if contact:
         text += f"\nطلب شحن محفظة: {esc(contact)}"
-    await reply(update, text)
+    await _show(update, text, home_markup())
 
 
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     orders = await s.repo.orders_for_user(update.effective_user.id, limit=10)
     if not orders:
-        await reply(update, "ما عندك طلبات للحين.")
+        await _show(update, "ما عندك طلبات للحين.",
+                    home_markup([InlineKeyboardButton(BTN_PRODUCTS, callback_data="m:shop")]))
         return
     rows = [[InlineKeyboardButton(
         f"{STATUS_LABELS.get(o.status, o.status)[:2]} {o.product_name[:28]} — {s.money(o.amount)}",
         callback_data=f"od:{o.uuid}")] for o in orders]
-    await reply(update, "📦 آخر طلباتك:", reply_markup=InlineKeyboardMarkup(rows))
+    await _show(update, "📦 آخر طلباتك:", home_markup(*rows))
 
 
 async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -110,21 +135,22 @@ async def order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if order is None or order.user_hash != s.repo.user_hash(update.effective_user.id):
         await reply(update, "الطلب غير موجود.")
         return
-    await reply(update, order_text(order, s, detailed=True))
+    await _show(update, order_text(order, s, detailed=True),
+                home_markup([InlineKeyboardButton("🔙 طلباتي", callback_data="m:ord")]))
 
 
 async def ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     entries = await s.repo.ledger_for_user(update.effective_user.id, limit=10)
     if not entries:
-        await reply(update, "ما فيه عمليات على محفظتك للحين.")
+        await _show(update, "ما فيه عمليات على محفظتك للحين.", home_markup())
         return
     lines = ["🧾 <b>آخر العمليات</b>"]
     for e in entries:
         sign = "+" if e.amount > 0 else ""
         lines.append(f"{when(e.created_at)} | {LEDGER_LABELS.get(e.type, e.type)} | "
                      f"{sign}{s.money(e.amount)} | الرصيد: {s.money(e.balance_after)}")
-    await reply(update, "\n".join(lines))
+    await _show(update, "\n".join(lines), home_markup())
 
 
 # ---------------------------------------------------------------------------
@@ -140,21 +166,25 @@ def _pager(prefix: str, page: int, total: int) -> list[InlineKeyboardButton]:
 
 
 async def _show(update: Update, text: str, markup: InlineKeyboardMarkup) -> None:
+    """Edit the tapped message in place; send a new one for typed input."""
     q = update.callback_query
     if q:
         try:
             await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
             return
-        except BadRequest:
-            pass
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return  # tapped the screen it is already on
     await reply(update, text, reply_markup=markup)
 
 
 async def categories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> None:
     s = svc(context)
-    if update.callback_query:
-        await update.callback_query.answer()
-        page = int(update.callback_query.data.split(":")[1])
+    q = update.callback_query
+    if q:
+        await q.answer()
+        if q.data.startswith("c:"):
+            page = int(q.data.split(":")[1])
     context.user_data.pop("draft", None)
     try:
         cats = await s.catalog.categories(await s.runtime.visible_products())
@@ -163,13 +193,14 @@ async def categories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: i
         await reply(update, "تعذّر تحميل المنتجات الحين، جرّب بعد شوي.")
         return
     if not cats:
-        await reply(update, "ما فيه منتجات متاحة حالياً.")
+        await _show(update, "ما فيه منتجات متاحة حالياً.", home_markup())
         return
     named = sorted([(await s.runtime.category_name(c), c) for c in cats], key=lambda nc: nc[0])
     chunk = named[page * PAGE:(page + 1) * PAGE]
     rows = [[InlineKeyboardButton(name[:60], callback_data=f"k:{c.key}:0")] for name, c in chunk]
     if nav := _pager("c", page, len(cats)):
         rows.append(nav)
+    rows.append(HOME_ROW)
     await _show(update, "🛒 اختر القسم:", InlineKeyboardMarkup(rows))
 
 
@@ -198,7 +229,9 @@ def _product_rows(items, key: str, page: int, total: int,
         rows.append([button])
     if nav := _pager(f"k:{key}", page, total):
         rows.append(nav)
-    rows.append([InlineKeyboardButton("🔙 الأقسام", callback_data="c:0")])
+    if any(locked for _, _, locked in items):
+        rows.append([TOPUP_BUTTON])
+    rows.append([InlineKeyboardButton("🔙 الأقسام", callback_data="c:0"), *HOME_ROW])
     return rows
 
 
@@ -327,7 +360,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     context.user_data.pop("draft", None)
     try:
-        await q.edit_message_text("تم إلغاء الطلب.")
+        await q.edit_message_text("تم إلغاء الطلب.", reply_markup=home_markup())
     except BadRequest:
         pass
 
@@ -347,8 +380,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     s = svc(context)
     draft = context.user_data.get("draft")
     if not draft or draft["uuid"]:
-        await reply(update, "اختر من القائمة 👇",
-                    reply_markup=main_keyboard(s.is_owner(update.effective_user.id)))
+        await reply(update, MENU_TEXT, reply_markup=menu_markup())
         return
     p = await s.catalog.product(draft["product_id"])
     if p is None or not await s.runtime.is_visible(p.id):
@@ -424,7 +456,8 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     except InsufficientFunds as exc:
         await reply(update, f"رصيدك ما يكفي.\nرصيدك: {s.money(exc.balance)}\n"
-                            f"المطلوب: {s.money(exc.needed)}\nاضغط «➕ شحن الرصيد».")
+                            f"المطلوب: {s.money(exc.needed)}\nاضغط «➕ شحن الرصيد».",
+                    reply_markup=home_markup([TOPUP_BUTTON]))
         return
     except PlayerBlocked as exc:
         context.user_data.pop("draft", None)
@@ -441,13 +474,17 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     context.user_data.pop("draft", None)
     order = result.order
     if result.duplicate:
-        await reply(update, "الطلب منفّذ مسبقاً:\n" + order_text(order, s))
+        await reply(update, "الطلب منفّذ مسبقاً:\n" + order_text(order, s),
+                    reply_markup=home_markup())
     elif order.status == "accept":
-        await reply(update, "✅ تم تنفيذ طلبك بنجاح\n\n" + order_text(order, s, detailed=True))
+        await reply(update, "✅ تم تنفيذ طلبك بنجاح\n\n" + order_text(order, s, detailed=True),
+                    reply_markup=home_markup())
     elif order.status == "reject":
-        await reply(update, "❌ الطلب انرفض، ورجع المبلغ لمحفظتك.\n\n" + order_text(order, s))
+        await reply(update, "❌ الطلب انرفض، ورجع المبلغ لمحفظتك.\n\n" + order_text(order, s),
+                    reply_markup=home_markup())
     else:
-        await reply(update, "⏳ طلبك قيد التنفيذ، بنرسل لك أول ما يكتمل.\n\n" + order_text(order, s))
+        await reply(update, "⏳ طلبك قيد التنفيذ، بنرسل لك أول ما يكتمل.\n\n" + order_text(order, s),
+                    reply_markup=home_markup())
 
 
 async def _player_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE, player_id: str,
@@ -455,7 +492,7 @@ async def _player_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE, pl
     """Customer entered a blocked player ID: cancel, tell them, and warn the owner."""
     s = svc(context)
     tg_id = update.effective_user.id
-    await reply(update, PLAYER_BLOCKED_TEXT)
+    await reply(update, PLAYER_BLOCKED_TEXT, reply_markup=home_markup())
     await s.repo.log_user(tg_id, "blocked_player_attempt", f"{player_id} {product_name}")
     await s.orders.alert_owner(
         "⚠️ عميل حاول يشحن لآيدي محظور\n"

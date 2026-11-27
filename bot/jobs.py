@@ -7,7 +7,7 @@ import time
 from telegram.ext import Application, ContextTypes
 
 from .g4s import G4SError, G4SUnavailable
-from .handlers.common import Services, order_text
+from .handlers.common import Services, home_markup, order_text
 from .repo import Order
 
 log = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ def make_notifiers(app: Application):
         try:
             await app.bot.send_message(user.telegram_id,
                                        f"{head}\n\n{order_text(order, s, detailed=True)}",
-                                       parse_mode="HTML")
+                                       parse_mode="HTML", reply_markup=home_markup())
         except Exception as exc:
             log.info("Could not notify user about %s: %s", order.uuid, exc)
 

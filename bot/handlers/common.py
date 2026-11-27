@@ -6,7 +6,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 
-from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+                      ReplyKeyboardMarkup, ReplyKeyboardRemove, Update)
 from telegram.ext import ContextTypes
 
 from ..catalog import Catalog, RuntimeSettings
@@ -81,15 +82,33 @@ def svc(context: ContextTypes.DEFAULT_TYPE) -> Services:
     return context.application.bot_data["svc"]
 
 
-def main_keyboard(is_owner: bool) -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(BTN_PRODUCTS)],
-        [KeyboardButton(BTN_BALANCE), KeyboardButton(BTN_TOPUP)],
-        [KeyboardButton(BTN_ORDERS), KeyboardButton(BTN_LEDGER)],
-    ]
+def bottom_keyboard(is_owner: bool) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
+    """The keyboard under the text box: only the owner's panel button. For
+    customers it removes the old full keyboard (the menu now lives in messages)."""
     if is_owner:
-        rows.append([KeyboardButton(BTN_ADMIN)])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        return ReplyKeyboardMarkup([[KeyboardButton(BTN_ADMIN)]], resize_keyboard=True,
+                                   is_persistent=True)
+    return ReplyKeyboardRemove()
+
+
+# Inline main menu (callback data "m:<item>").
+HOME_ROW = [InlineKeyboardButton("🏠 القائمة", callback_data="m:home")]
+TOPUP_BUTTON = InlineKeyboardButton(BTN_TOPUP, callback_data="m:top")
+MENU_TEXT = "اختر من القائمة:"
+
+
+def menu_markup() -> InlineKeyboardMarkup:
+    b = InlineKeyboardButton
+    return InlineKeyboardMarkup([
+        [b(BTN_PRODUCTS, callback_data="m:shop")],
+        [b(BTN_BALANCE, callback_data="m:bal"), TOPUP_BUTTON],
+        [b(BTN_ORDERS, callback_data="m:ord"), b(BTN_LEDGER, callback_data="m:led")],
+    ])
+
+
+def home_markup(*rows) -> InlineKeyboardMarkup:
+    """Given rows plus the "🏠 القائمة" row at the bottom."""
+    return InlineKeyboardMarkup([*rows, HOME_ROW])
 
 
 def esc(text) -> str:

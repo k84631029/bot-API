@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.request import BaseRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, TypeHandler, filters)
@@ -51,10 +51,18 @@ def build_app(settings: Settings, store: Store | None = None, api: G4SClient | N
     async def post_shutdown(app: Application) -> None:
         await api.aclose()
 
+    async def post_init(app: Application) -> None:
+        # The blue "Menu" button next to the text box opens /start.
+        try:
+            await app.bot.set_my_commands([BotCommand("start", "القائمة الرئيسية")])
+        except Exception as exc:  # not critical: the bot works without it
+            log.warning("Could not set bot commands: %s", exc)
+
     builder = Application.builder().token(settings.bot_token)
     if request is not None:
         builder = builder.request(request).get_updates_request(request)
     app = (builder
+           .post_init(post_init)
            .post_shutdown(post_shutdown)
            # One slow provider call must not block other customers. Wallet
            # safety comes from Firestore transactions, not from serial updates.
@@ -85,6 +93,7 @@ def build_app(settings: Settings, store: Store | None = None, api: G4SClient | N
     app.add_handler(CommandHandler("recheck", owner.recheck))
     app.add_handler(CommandHandler("logs", owner.logs))
 
+    app.add_handler(CallbackQueryHandler(user.menu, pattern=r"^m:(home|shop|bal|top|ord|led)$"))
     app.add_handler(CallbackQueryHandler(user.categories, pattern=r"^c:\d+$"))
     app.add_handler(CallbackQueryHandler(user.category, pattern=r"^k:[0-9a-f]{10}:\d+$"))
     app.add_handler(CallbackQueryHandler(user.product, pattern=r"^p:\d+$"))
