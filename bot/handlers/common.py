@@ -25,7 +25,7 @@ BTN_LEDGER = "🧾 سجل المحفظة"
 BTN_TOPUP = "➕ شحن الرصيد"
 BTN_ADMIN = "🛠 لوحة المالك"
 BTN_ACCOUNT = "👤 حسابي"
-BTN_TRANSFER = "🔄 تحويل لصديق (قريباً)"
+BTN_TRANSFER = "🔄 تحويل لصديق"
 # What customers see for the first field of every product (the player ID),
 # whatever name the provider gives it.
 PLAYER_ID_LABEL = "ايدي الشحن"
@@ -42,7 +42,11 @@ LEDGER_LABELS = {
     "refund": "↩️ استرجاع",
     "owner_credit": "➕ شحن",
     "owner_debit": "➖ خصم",
+    "transfer_out": "🔄 تحويل لـ",
+    "transfer_in": "🔄 تحويل من",
+    "transfer_refund": "↩️ استرجاع تحويل لـ",
 }
+TRANSFER_KINDS = {"transfer_out", "transfer_in", "transfer_refund"}
 # Riyadh time for display.
 DISPLAY_TZ = timezone(timedelta(hours=3))
 

@@ -64,6 +64,7 @@ def _panel_markup(maintenance: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [b("💰 شحن رصيد عميل", callback_data="a:cr"), b("➖ خصم من عميل", callback_data="a:db")],
         [b("👤 إدارة عميل", callback_data="a:us"), b("🚫 آيديات محظورة", callback_data="a:bl")],
+        [b("🔄 التحويل بين العملاء", callback_data="a:tf")],
         [b("🧩 المنتجات المعروضة", callback_data="a:pv:0"), b("📈 نسبة الربح", callback_data="a:mg")],
         [b("📋 الطلبات المعلّقة", callback_data="a:open"), b("🔍 بحث عن طلب", callback_data="a:od")],
         [b("💳 رصيدي عند المزود", callback_data="a:bal"),
@@ -884,6 +885,13 @@ _BUTTONS = {
     "ba": lambda u, c, a: _btn_block_ask(u, c),
     "bu": lambda u, c, a: _btn_unblock(u, c, a),
     "bo": lambda u, c, a: _btn_block_from_order(u, c, a),
+    "tf": lambda u, c, a: _transfers_menu(u, c, edit=True),
+    "tt": lambda u, c, a: _btn_toggle_transfers(u, c),
+    "tl": lambda u, c, a: _transfers_list(u, c, a, edit=True),
+    "ta": lambda u, c, a: _btn_decide(u, c, a, approve=True, from_list=False),
+    "tr": lambda u, c, a: _btn_decide(u, c, a, approve=False, from_list=False),
+    "la": lambda u, c, a: _btn_decide(u, c, a, approve=True, from_list=True),
+    "lr": lambda u, c, a: _btn_decide(u, c, a, approve=False, from_list=True),
 }
 
 
@@ -986,3 +994,166 @@ async def _ask_rename(update: Update, context: ContextTypes.DEFAULT_TYPE, target
                         "أرسل الاسم الجديد اللي يشوفه العملاء.\n"
                         "أو أرسل <code>-</code> عشان ترجّع اسم المزود.",
                 reply_markup=CANCEL_MARKUP)
+
+
+
+# ---------------------------------------------------------------------------
+# Transfers between customers: on/off switch, requests, approve / reject
+# ---------------------------------------------------------------------------
+TRANSFER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_LIST_TITLES = {"p": "⏳ التحويلات المعلّقة", "a": "✅ التحويلات المقبولة",
+                "r": "❌ التحويلات المرفوضة"}
+
+
+def _who(user, fallback: str = "?") -> str:
+    if user is None:
+        return fallback
+    return f"{user.first_name or user.telegram_id} ({user.telegram_id})"
+
+
+async def _parties(s, transfer):
+    return (await s.repo.get_user_by_hash(transfer.from_hash),
+            await s.repo.get_user_by_hash(transfer.to_hash))
+
+
+def _decision_markup(transfer_id: str, prefix: str = "t") -> InlineKeyboardMarkup:
+    """prefix "t": buttons on the alert message; "l": buttons inside the list."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ موافقة", callback_data=f"a:{prefix}a:{transfer_id}"),
+        InlineKeyboardButton("❌ رفض", callback_data=f"a:{prefix}r:{transfer_id}"),
+    ]])
+
+
+async def notify_new_transfer(context: ContextTypes.DEFAULT_TYPE, transfer, from_id: int,
+                              from_name: str, to_id: int, to_name: str) -> None:
+    """Tell every owner about a new transfer, with approve / reject buttons."""
+    s = svc(context)
+    text = ("🔄 <b>طلب تحويل جديد</b>\n\n"
+            f"من: {esc(from_name)} (<code>{from_id}</code>)\n"
+            f"إلى: {esc(to_name)} (<code>{to_id}</code>)\n"
+            f"المبلغ: <b>{s.money(transfer.amount)}</b>\n\n"
+            "المبلغ انخصم من المرسل ومحجوز لين تقرر.")
+    for owner_id in s.settings.owner_ids:
+        try:
+            await context.bot.send_message(owner_id, text, parse_mode="HTML",
+                                           reply_markup=_decision_markup(transfer.id))
+        except Exception as exc:
+            log.warning("Could not alert owner %s about a transfer: %s", owner_id, exc)
+
+
+async def _transfers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool) -> None:
+    s = svc(context)
+    on = await s.runtime.transfers_enabled()
+    pending = await s.repo.pending_transfers(limit=100)
+    cfg = s.settings
+    b = InlineKeyboardButton
+    text = ("🔄 <b>التحويل بين العملاء</b>\n\n"
+            f"الحالة: {'🟢 شغّال' if on else '🔴 متوقف'}\n"
+            f"الحدود: من {s.money(cfg.transfer_min)} إلى {s.money(cfg.transfer_max)}، "
+            f"{cfg.transfers_per_day} تحويلات في اليوم لكل عميل\n"
+            f"معلّقة تنتظر قرارك: {len(pending)}")
+    markup = InlineKeyboardMarkup([
+        [b("🔴 إيقاف التحويل" if on else "🟢 تشغيل التحويل", callback_data="a:tt")],
+        [b(f"⏳ المعلّقة ({len(pending)})", callback_data="a:tl:p")],
+        [b("✅ المقبولة", callback_data="a:tl:a"), b("❌ المرفوضة", callback_data="a:tl:r")],
+        [b("🔙 لوحة المالك", callback_data="a:home")],
+    ])
+    if edit:
+        await _edit_or_reply(update, text, markup)
+    else:
+        await reply(update, text, reply_markup=markup)
+
+
+async def _btn_toggle_transfers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    s = svc(context)
+    on = not await s.runtime.transfers_enabled()
+    await s.repo.update_settings(transfers_enabled=on)
+    s.runtime.invalidate()
+    await _audit(context, update, "transfers", "on" if on else "off")
+    await _transfers_menu(update, context, edit=True)
+
+
+async def _transfers_list(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str,
+                          edit: bool) -> None:
+    if kind not in _LIST_TITLES:
+        return
+    s = svc(context)
+    if kind == "p":
+        items = await s.repo.pending_transfers(limit=30)
+    else:
+        items = await s.repo.recent_transfers("approved" if kind == "a" else "rejected", limit=20)
+    b = InlineKeyboardButton
+    lines = [f"<b>{_LIST_TITLES[kind]}</b>", ""]
+    rows = []
+    for t in items:
+        sender, receiver = await _parties(s, t)
+        stamp = when(t.created_at if kind == "p" else t.decided_at)
+        lines.append(f"• {stamp} | {esc(_who(sender))} → {esc(_who(receiver))} | "
+                     f"<b>{s.money(t.amount)}</b>")
+        if kind == "p":
+            short = (f"{(sender.first_name if sender else '?')[:12]}→"
+                     f"{(receiver.first_name if receiver else '?')[:12]}")
+            rows.append([b(f"✅ {s.money(t.amount)} {short}", callback_data=f"a:la:{t.id}"),
+                         b("❌ رفض", callback_data=f"a:lr:{t.id}")])
+    if not items:
+        lines.append("ما فيه تحويلات.")
+    rows.append([b("🔙 التحويلات", callback_data="a:tf")])
+    text, markup = "\n".join(lines), InlineKeyboardMarkup(rows)
+    if edit:
+        await _edit_or_reply(update, text, markup)
+    else:
+        await reply(update, text, reply_markup=markup)
+
+
+async def _btn_decide(update: Update, context: ContextTypes.DEFAULT_TYPE, transfer_id: str,
+                      approve: bool, from_list: bool) -> None:
+    if not TRANSFER_ID_RE.match(transfer_id):
+        return
+    s = svc(context)
+    result = await s.repo.decide_transfer(transfer_id, approve, update.effective_user.id)
+    if result is None:
+        await reply(update, "هذا التحويل تقرر مسبقاً.")
+        if from_list:
+            await _transfers_list(update, context, "p", edit=True)
+        return
+    transfer, new_balance = result
+    sender, receiver = await _parties(s, transfer)
+    sender_name = sender.first_name if sender and sender.first_name else "?"
+    receiver_name = receiver.first_name if receiver and receiver.first_name else "?"
+    amount = s.money(transfer.amount)
+    await _audit(context, update, "transfer_approve" if approve else "transfer_reject",
+                 f"{_who(sender)} -> {_who(receiver)} {transfer.amount}")
+    home = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 القائمة", callback_data="m:home")]])
+    if approve:
+        messages = [
+            (receiver, "✅ تمت الموافقة على التحويل\n\n"
+                       f"من: {esc(sender_name)}\nالمبلغ: {amount}\n"
+                       f"رصيدك الحالي: {s.money(new_balance)}",
+             InlineKeyboardMarkup([[InlineKeyboardButton("🛒 المنتجات", callback_data="m:shop"),
+                                    InlineKeyboardButton("🏠 القائمة", callback_data="m:home")]])),
+            (sender, f"✅ وصل تحويلك إلى {esc(receiver_name)} ({amount})", home),
+        ]
+    else:
+        messages = [
+            (sender, "❌ المالك رفض التحويل، ورجع المبلغ لمحفظتك.\n"
+                     f"المبلغ: {amount}\nرصيدك الحالي: {s.money(new_balance)}", home),
+            (receiver, f"❌ تم إلغاء التحويل من {esc(sender_name)}.", home),
+        ]
+    for user, text, markup in messages:
+        if user is None:
+            continue
+        try:
+            await context.bot.send_message(user.telegram_id, text, parse_mode="HTML",
+                                           reply_markup=markup)
+        except Exception as exc:
+            log.info("Could not notify %s about a transfer: %s", user.telegram_id, exc)
+
+    result_line = (f"✅ وافقت على تحويل {amount} من {esc(_who(sender))} إلى {esc(_who(receiver))}"
+                   if approve else
+                   f"❌ رفضت تحويل {amount} من {esc(_who(sender))}، ورجع المبلغ له.")
+    if from_list:
+        await reply(update, result_line)
+        await _transfers_list(update, context, "p", edit=True)
+    else:
+        await _edit_or_reply(update, result_line, InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔄 التحويلات", callback_data="a:tf")]]))

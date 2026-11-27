@@ -650,10 +650,149 @@ async def test_account_screen(h):
     assert data == ["m:ord", "m:led", "m:xfer", "m:home"]
 
     await h.press(CUSTOMER, "m:xfer")
-    assert "قريباً" in h.tg.alerts()[-1]["text"]
+    assert "متوقف" in h.tg.alerts()[-1]["text"]  # transfers start switched off
 
     await h.press(CUSTOMER, "m:led")
     assert "آخر العمليات" in h.tg.last_text(CUSTOMER)
     assert [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)] == ["m:acc", "m:home"]
     await h.press(CUSTOMER, "m:ord")
     assert [b["callback_data"] for b in h.tg.last_buttons(CUSTOMER)][-2:] == ["m:acc", "m:home"]
+
+
+
+async def _enable_transfers(h):
+    await h.press(OWNER, "a:tf")
+    assert "🔴 متوقف" in h.tg.last_text(OWNER)
+    await h.press(OWNER, "a:tt")
+    assert "🟢 شغّال" in h.tg.last_text(OWNER)
+    assert await h.svc.runtime.transfers_enabled()
+
+
+async def _start_transfer(h, amount: str):
+    await h.press(CUSTOMER, "m:xfer")
+    await h.text(CUSTOMER, str(STRANGER))
+    await h.text(CUSTOMER, amount)
+    confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("t:ok:"))
+    await h.press(CUSTOMER, confirm["callback_data"])
+    return confirm["callback_data"]
+
+
+async def _balance_of(h, uid):
+    return (await h.svc.repo.get_user(uid)).balance
+
+
+async def test_transfer_approved_by_owner(h):
+    await _enable_transfers(h)
+    await h.text(STRANGER, "/start")
+    await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 50")
+
+    await h.press(CUSTOMER, "m:xfer")
+    assert "أرسل آيدي صديقك" in h.tg.last_text(CUSTOMER)
+    for typed, expected in (("abc", "أرقام"), (str(CUSTOMER), "لنفسك"), ("999", "غير مسجّل")):
+        await h.text(CUSTOMER, typed)
+        assert expected in h.tg.last_text(CUSTOMER)
+    await h.text(CUSTOMER, str(STRANGER))
+    assert f"U{STRANGER}" in h.tg.last_text(CUSTOMER) and "أرسل المبلغ" in h.tg.last_text(CUSTOMER)
+    for typed, expected in (("3", "أقل مبلغ"), ("201", "أعلى مبلغ"), ("60", "رصيدك ما يكفي")):
+        await h.text(CUSTOMER, typed)
+        assert expected in h.tg.last_text(CUSTOMER)
+    await h.text(CUSTOMER, "20")
+    assert "تأكيد التحويل" in h.tg.last_text(CUSTOMER) and "30.00" in h.tg.last_text(CUSTOMER)
+    confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("t:ok:"))
+    await h.press(CUSTOMER, confirm["callback_data"])
+
+    assert "بانتظار موافقة المالك" in h.tg.last_text(CUSTOMER)
+    assert "رصيدك الحالي: 30.00" in h.tg.last_text(CUSTOMER)
+    assert "وصلك تحويل" in h.tg.last_text(STRANGER)
+    assert await _balance_of(h, CUSTOMER) == Decimal("30.00")
+    assert await _balance_of(h, STRANGER) == Decimal("0")
+
+    await h.press(CUSTOMER, confirm["callback_data"])  # double tap
+    assert len(await h.svc.repo.pending_transfers()) == 1
+
+    assert "طلب تحويل جديد" in h.tg.last_text(OWNER)
+    approve = next(b for b in h.tg.last_buttons(OWNER) if b["callback_data"].startswith("a:ta:"))
+    await h.press(OWNER, approve["callback_data"])
+    assert await _balance_of(h, STRANGER) == Decimal("20.00")
+    assert "تمت الموافقة" in h.tg.last_text(STRANGER)
+    assert "وصل تحويلك" in h.tg.last_text(CUSTOMER)
+    assert "وافقت على تحويل" in h.tg.last_text(OWNER)
+
+    await h.press(OWNER, approve["callback_data"])  # second tap: nothing more
+    assert "تقرر مسبقاً" in h.tg.last_text(OWNER)
+    assert await _balance_of(h, STRANGER) == Decimal("20.00")
+
+    await h.press(OWNER, "a:tl:a")
+    assert "20.00" in h.tg.last_text(OWNER)
+    await h.text(CUSTOMER, "🧾 سجل المحفظة")
+    assert f"🔄 تحويل لـ U{STRANGER}" in h.tg.last_text(CUSTOMER)
+    await h.text(STRANGER, "🧾 سجل المحفظة")
+    assert f"🔄 تحويل من U{CUSTOMER}" in h.tg.last_text(STRANGER)
+    logs = [a for _, _, a, _ in await h.svc.repo.owner_logs()]
+    assert "transfers" in logs and "transfer_approve" in logs
+
+
+async def test_transfer_rejected_from_list_refunds(h):
+    await _enable_transfers(h)
+    await h.text(STRANGER, "/start")
+    await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 50")
+    await _start_transfer(h, "15")
+    assert await _balance_of(h, CUSTOMER) == Decimal("35.00")
+
+    await h.press(OWNER, "a:tf")
+    assert "معلّقة تنتظر قرارك: 1" in h.tg.last_text(OWNER)
+    await h.press(OWNER, "a:tl:p")
+    assert "15.00" in h.tg.last_text(OWNER)
+    reject = next(b for b in h.tg.last_buttons(OWNER) if b["callback_data"].startswith("a:lr:"))
+    await h.press(OWNER, reject["callback_data"])
+
+    assert await _balance_of(h, CUSTOMER) == Decimal("50.00")
+    assert await _balance_of(h, STRANGER) == Decimal("0")
+    assert "رفض التحويل" in h.tg.last_text(CUSTOMER)
+    assert "إلغاء التحويل" in h.tg.last_text(STRANGER)
+    assert "ما فيه تحويلات" in h.tg.last_text(OWNER)
+    await h.press(OWNER, "a:tl:r")
+    assert "15.00" in h.tg.last_text(OWNER)
+
+
+async def test_transfer_daily_limit_and_cancel(h):
+    import dataclasses
+    h.svc.settings = dataclasses.replace(h.svc.settings, transfers_per_day=1)
+    await _enable_transfers(h)
+    await h.text(STRANGER, "/start")
+    await h.text(CUSTOMER, "/start")
+    await h.text(OWNER, f"/credit {CUSTOMER} 50")
+
+    await h.press(CUSTOMER, "m:xfer")
+    await h.press(CUSTOMER, "t:x")
+    assert "تم إلغاء التحويل" in h.tg.last_text(CUSTOMER)
+    await h.text(CUSTOMER, str(STRANGER))  # the prompt is gone
+    assert "اختر من القائمة" in h.tg.last_text(CUSTOMER)
+
+    await _start_transfer(h, "5")
+    await h.press(CUSTOMER, "m:xfer")
+    assert "وصلت حد التحويلات اليومي (1)" in h.tg.last_text(CUSTOMER)
+
+
+async def test_transfer_needs_minimum_balance(h):
+    await _enable_transfers(h)
+    await h.text(CUSTOMER, "/start")
+    await h.press(CUSTOMER, "m:xfer")
+    assert "ورصيدك ما يكفي" in h.tg.last_text(CUSTOMER)
+    assert any(b["callback_data"] == "m:top" for b in h.tg.last_buttons(CUSTOMER))
+
+
+async def test_customer_cannot_decide_or_toggle_transfers(h):
+    await h.text(CUSTOMER, "/start")
+    await h.text(STRANGER, "/start")
+    await h.svc.repo.adjust_balance(CUSTOMER, Decimal("10"), "owner_credit")
+    tid = "e" * 32
+    await h.svc.repo.create_transfer(tid, CUSTOMER, STRANGER, Decimal("5"), "2026-11-28", 10)
+    for data in (f"a:ta:{tid}", f"a:la:{tid}", f"a:tr:{tid}", "a:tt", "a:tl:p"):
+        await h.press(CUSTOMER, data)
+        await h.press(STRANGER, data)
+    assert [t.id for t in await h.svc.repo.pending_transfers()] == [tid]
+    assert not await h.svc.runtime.transfers_enabled()
+    assert await _balance_of(h, STRANGER) == Decimal("0")

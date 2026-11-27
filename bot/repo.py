@@ -12,6 +12,7 @@ Collections:
   owner_logs/{id}           owner actions
   settings/global           maintenance flag, margin, visible products
   blocked_players/{tag}     player IDs nobody may top up (value encrypted)
+  transfers/{id}            customer-to-customer transfers waiting for / decided by the owner
 """
 from __future__ import annotations
 
@@ -25,8 +26,8 @@ from .money import ZERO, to_decimal
 from .security import Crypto
 from .store import Store, Tx, new_id
 
-USERS, ORDERS, LEDGER, LOGS, OWNER_LOGS, SETTINGS, BLOCKED = (
-    "users", "orders", "ledger", "logs", "owner_logs", "settings", "blocked_players")
+USERS, ORDERS, LEDGER, LOGS, OWNER_LOGS, SETTINGS, BLOCKED, TRANSFERS = (
+    "users", "orders", "ledger", "logs", "owner_logs", "settings", "blocked_players", "transfers")
 _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 
@@ -51,6 +52,14 @@ class UserNotFound(Exception):
 
 class UserBanned(Exception):
     pass
+
+
+class TransferNotAllowed(Exception):
+    """Receiver missing, banned, or the sender themself."""
+
+
+class TransferLimit(Exception):
+    """Sender reached the daily number of transfers."""
 
 
 def utcnow() -> datetime:
@@ -92,6 +101,17 @@ class Order:
     @property
     def is_final(self) -> bool:
         return self.status in FINAL_STATUSES
+
+
+@dataclass
+class Transfer:
+    id: str
+    from_hash: str
+    to_hash: str
+    amount: Decimal
+    status: str  # pending | approved | rejected
+    created_at: datetime | None
+    decided_at: datetime | None
 
 
 @dataclass
@@ -439,6 +459,134 @@ class Repo:
 
         return await self.store.run_transaction(fn)
 
+
+    # -- transfers between customers ------------------------------------------
+    # The amount leaves the sender's wallet when the transfer is requested (held)
+    # and reaches the receiver only when the owner approves; a rejection gives it
+    # back to the sender. Every step is one transaction and happens at most once.
+    def _transfer(self, tid: str, d: dict) -> Transfer:
+        return Transfer(
+            id=tid,
+            from_hash=d["from_hash"],
+            to_hash=d["to_hash"],
+            amount=to_decimal(self._dec(TRANSFERS, tid, "amount", d.get("amount_enc"), "0")),
+            status=d["status"],
+            created_at=d.get("created_at"),
+            decided_at=d.get("decided_at"),
+        )
+
+    def _name_of(self, uhash: str, doc: dict | None, fallback: str = "") -> str:
+        if not doc:
+            return fallback
+        return self._dec(USERS, uhash, "first_name", doc.get("first_name_enc")) or fallback
+
+    async def transfers_today(self, telegram_id: int, day: str) -> int:
+        doc = await self.store.get(USERS, self.user_hash(telegram_id)) or {}
+        return int(doc.get("transfer_count", 0)) if doc.get("transfer_day") == day else 0
+
+    async def create_transfer(self, transfer_id: str, from_id: int, to_id: int, amount: Decimal,
+                              day: str, per_day: int) -> tuple[Transfer, Decimal, bool]:
+        """Hold `amount` from the sender and record a pending transfer.
+        Returns (transfer, sender's new balance, created). Idempotent on transfer_id."""
+        fh, th = self.user_hash(from_id), self.user_hash(to_id)
+
+        async def fn(tx: Tx):
+            existing = await tx.get(TRANSFERS, transfer_id)
+            sender = await tx.get(USERS, fh)
+            receiver = await tx.get(USERS, th)
+            if sender is None:
+                raise UserNotFound(from_id)
+            balance = to_decimal(self._dec(USERS, fh, "balance", sender.get("balance_enc"), "0"))
+            if existing is not None:
+                return existing, balance, False
+            if receiver is None or fh == th or receiver.get("banned"):
+                raise TransferNotAllowed(to_id)
+            if sender.get("banned"):
+                raise UserBanned(from_id)
+            count = int(sender.get("transfer_count", 0)) if sender.get("transfer_day") == day else 0
+            if count >= per_day:
+                raise TransferLimit(per_day)
+            if balance < amount:
+                raise InsufficientFunds(balance, amount)
+            new_balance = balance - amount
+            now = utcnow()
+            doc = {
+                "from_hash": fh,
+                "to_hash": th,
+                "amount_enc": self._enc(TRANSFERS, transfer_id, "amount", str(amount)),
+                "status": "pending",
+                "created_at": now,
+                "decided_at": None,
+                "decided_by": None,
+            }
+            tx.merge(USERS, fh, {"balance_enc": self._enc(USERS, fh, "balance", str(new_balance)),
+                                 "transfer_day": day, "transfer_count": count + 1})
+            tx.set(TRANSFERS, transfer_id, doc)
+            ledger_id = f"xfer_out_{transfer_id}"
+            tx.set(LEDGER, ledger_id, self._ledger_doc(
+                ledger_id, fh, "transfer_out", -amount, new_balance, transfer_id,
+                self._name_of(th, receiver, str(to_id)), None))
+            return doc, new_balance, True
+
+        doc, new_balance, created = await self.store.run_transaction(fn)
+        return self._transfer(transfer_id, doc), new_balance, created
+
+    async def decide_transfer(self, transfer_id: str, approve: bool,
+                              owner_id: int) -> tuple[Transfer, Decimal] | None:
+        """Approve (credit the receiver) or reject (refund the sender) a pending
+        transfer. Returns (transfer, the credited party's new balance), or None if
+        it was already decided."""
+
+        async def fn(tx: Tx):
+            doc = await tx.get(TRANSFERS, transfer_id)
+            if doc is None or doc["status"] != "pending":
+                return None
+            sender = await tx.get(USERS, doc["from_hash"])
+            receiver = await tx.get(USERS, doc["to_hash"])
+            amount = to_decimal(self._dec(TRANSFERS, transfer_id, "amount", doc.get("amount_enc"), "0"))
+            # approve -> money goes to the receiver; reject -> back to the sender
+            target_hash, target = ((doc["to_hash"], receiver) if approve
+                                   else (doc["from_hash"], sender))
+            balance = to_decimal(self._dec(USERS, target_hash, "balance",
+                                           (target or {}).get("balance_enc"), "0"))
+            new_balance = balance + amount
+            if approve:
+                kind, ledger_id = "transfer_in", f"xfer_in_{transfer_id}"
+                note = self._name_of(doc["from_hash"], sender)
+            else:
+                kind, ledger_id = "transfer_refund", f"xfer_back_{transfer_id}"
+                note = self._name_of(doc["to_hash"], receiver)
+            patch = {"status": "approved" if approve else "rejected", "decided_at": utcnow(),
+                     "decided_by": self.user_hash(owner_id)}
+            tx.merge(USERS, target_hash,
+                     {"balance_enc": self._enc(USERS, target_hash, "balance", str(new_balance))})
+            tx.set(LEDGER, ledger_id, self._ledger_doc(
+                ledger_id, target_hash, kind, amount, new_balance, transfer_id, note, None))
+            tx.merge(TRANSFERS, transfer_id, patch)
+            doc.update(patch)
+            return doc, new_balance
+
+        result = await self.store.run_transaction(fn)
+        if result is None:
+            return None
+        doc, new_balance = result
+        return self._transfer(transfer_id, doc), new_balance
+
+    async def get_transfer(self, transfer_id: str) -> Transfer | None:
+        doc = await self.store.get(TRANSFERS, transfer_id)
+        return self._transfer(transfer_id, doc) if doc else None
+
+    async def pending_transfers(self, limit: int = 30) -> list[Transfer]:
+        rows = await self.store.query(TRANSFERS, [("status", "==", "pending")])
+        items = [self._transfer(i, d) for i, d in rows]
+        items.sort(key=lambda t: t.created_at or utcnow(), reverse=True)
+        return items[:limit]
+
+    async def recent_transfers(self, status: str, limit: int = 20) -> list[Transfer]:
+        """Newest decided transfers of one status, among the latest 300 overall
+        (ordering by date alone needs no extra Firestore index)."""
+        rows = await self.store.query(TRANSFERS, order_by="created_at", descending=True, limit=300)
+        return [self._transfer(i, d) for i, d in rows if d.get("status") == status][:limit]
 
     # -- custom display names ---------------------------------------------------
     async def set_display_name(self, kind: str, key: str, name: str | None) -> None:

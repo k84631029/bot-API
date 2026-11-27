@@ -2,19 +2,24 @@
 from __future__ import annotations
 
 import logging
+import secrets
+import time
 import uuid
+from datetime import timedelta
+from decimal import Decimal
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from ..g4s import G4SError, G4SUnavailable, Product
-from ..money import ZERO, to_decimal
+from ..money import ZERO, InvalidAmount, parse_user_amount, to_decimal
 from ..orders import PLAYER_BLOCKED_TEXT, OrderRejectedBeforeDebit, PlayerBlocked, PriceChanged
-from ..repo import InsufficientFunds, UserBanned
+from ..repo import (InsufficientFunds, TransferLimit, TransferNotAllowed, UserBanned,
+                    utcnow)
 from . import owner
 from .common import (ACCOUNT_ROW, BTN_ACCOUNT, BTN_TRANSFER, BTN_BALANCE, BTN_LEDGER, BTN_ORDERS, BTN_PRODUCTS, BTN_TOPUP, HOME_ROW,
-                     LEDGER_LABELS, STATUS_LABELS, TOPUP_BUTTON, bottom_keyboard, esc,
+                     LEDGER_LABELS, STATUS_LABELS, TRANSFER_KINDS, TOPUP_BUTTON, bottom_keyboard, esc,
                      field_label, home_markup, menu_markup, menu_text, order_text, reply, svc, when)
 
 log = logging.getLogger(__name__)
@@ -63,6 +68,7 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     context.user_data.pop("draft", None)
+    _clear_transfer(context)
     await _set_bottom_keyboard(update, s.is_owner(update.effective_user.id))
     await reply(update, menu_text(update.effective_user), reply_markup=menu_markup())
 
@@ -84,11 +90,13 @@ async def _set_bottom_keyboard(update: Update, is_owner: bool) -> None:
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Inline main menu buttons (m:<item>)."""
     item = update.callback_query.data.split(":", 1)[1]
+    if item != "xfer":
+        _clear_transfer(context)
     if item == "shop":
         await categories(update, context)
         return
     if item == "xfer":
-        await update.callback_query.answer("🔜 التحويل لصديق قريباً إن شاء الله.", show_alert=True)
+        await transfer_start(update, context)
         return
     await update.callback_query.answer()
     if item == "home":
@@ -179,7 +187,10 @@ async def ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["🧾 <b>آخر العمليات</b>"]
     for e in entries:
         sign = "+" if e.amount > 0 else ""
-        lines.append(f"{when(e.created_at)} | {LEDGER_LABELS.get(e.type, e.type)} | "
+        label = LEDGER_LABELS.get(e.type, e.type)
+        if e.type in TRANSFER_KINDS and e.note:
+            label = f"{label} {esc(e.note)}"
+        lines.append(f"{when(e.created_at)} | {label} | "
                      f"{sign}{s.money(e.amount)} | الرصيد: {s.money(e.balance_after)}")
     await _show(update, "\n".join(lines), InlineKeyboardMarkup([ACCOUNT_ROW]))
 
@@ -319,6 +330,7 @@ async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                        f"السعر: {s.money(price)}\nاشحن من «➕ شحن الرصيد»", show_alert=True)
         return
     await q.answer()
+    _clear_transfer(context)
     context.user_data["draft"] = {"product_id": p.id, "values": [], "qty": None,
                                   "uuid": None, "total": None}
     await _next_step(update, context, p)
@@ -406,6 +418,8 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await routes[text](update, context)
         return
     if await owner.handle_text(update, context):
+        return
+    if await transfer_text(update, context):
         return
 
     s = svc(context)
@@ -528,3 +542,178 @@ async def _player_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE, pl
     await s.orders.alert_owner(
         "⚠️ عميل حاول يشحن لآيدي محظور\n"
         f"العميل: {tg_id}\nالآيدي: {player_id}\nالمنتج: {product_name}")
+
+
+
+# ---------------------------------------------------------------------------
+# Transfer to a friend (needs the owner's approval)
+#   user_data["xfer"]    = {"step": "id"|"amount", "at": t, "to": id, "name": str}
+#   user_data["xfer_op"] = {"id": nonce, "tid": transfer id, "to", "name", "amount"}
+# ---------------------------------------------------------------------------
+XFER_TTL_SECONDS = 600
+XFER_CANCEL = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="t:x")]])
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+PENDING_LINE = "⏳ بانتظار موافقة المالك"
+
+
+def _riyadh_day() -> str:
+    return (utcnow() + timedelta(hours=3)).date().isoformat()
+
+
+def _clear_transfer(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("xfer", None)
+    context.user_data.pop("xfer_op", None)
+
+
+async def transfer_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    s = svc(context)
+    q = update.callback_query
+    tg_id = update.effective_user.id
+    if not await s.runtime.transfers_enabled():
+        await q.answer("🔜 التحويل لصديق متوقف حالياً.", show_alert=True)
+        return
+    await q.answer()
+    cfg = s.settings
+    balance = await _balance(s, tg_id)
+    if balance < cfg.transfer_min:
+        await _show(update, f"🔄 <b>{BTN_TRANSFER[2:]}</b>\n\nرصيدك: {s.money(balance)}\n"
+                            f"أقل مبلغ للتحويل {s.money(cfg.transfer_min)}، ورصيدك ما يكفي.",
+                    home_markup([TOPUP_BUTTON]))
+        return
+    if await s.repo.transfers_today(tg_id, _riyadh_day()) >= cfg.transfers_per_day:
+        await _show(update, f"وصلت حد التحويلات اليومي ({cfg.transfers_per_day}). جرّب بكرة.",
+                    home_markup())
+        return
+    context.user_data.pop("draft", None)
+    context.user_data.pop("xfer_op", None)
+    context.user_data["xfer"] = {"step": "id", "at": time.monotonic()}
+    await _show(update, f"🔄 <b>{BTN_TRANSFER[2:]}</b>\n\n"
+                        f"رصيدك: {s.money(balance)}\n"
+                        f"أقل تحويل: {s.money(cfg.transfer_min)} · "
+                        f"أعلى تحويل: {s.money(cfg.transfer_max)}\n"
+                        "التحويل يوصل لصديقك بعد موافقة المالك.\n\n"
+                        "أرسل آيدي صديقك (يلقاه عنده في «👤 حسابي»):", XFER_CANCEL)
+
+
+async def transfer_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Answers to the transfer prompts. Returns True if the text was one."""
+    step = context.user_data.get("xfer")
+    if not step:
+        return False
+    if time.monotonic() - step["at"] > XFER_TTL_SECONDS:
+        _clear_transfer(context)
+        return False
+    s = svc(context)
+    cfg = s.settings
+    tg_id = update.effective_user.id
+    text = (update.effective_message.text or "").strip()
+
+    if step["step"] == "id":
+        digits = text.translate(_AR_DIGITS)
+        if not digits.isdigit():
+            await reply(update, "الآيدي لازم يكون أرقام بس. أرسله مرة ثانية:",
+                        reply_markup=XFER_CANCEL)
+            return True
+        to_id = int(digits)
+        if to_id == tg_id:
+            await reply(update, "ما تقدر تحوّل لنفسك 😅\nأرسل آيدي صديقك:", reply_markup=XFER_CANCEL)
+            return True
+        target = await s.repo.get_user(to_id)
+        if target is None:
+            await reply(update, "هذا الآيدي غير مسجّل في البوت. تأكد منه وأرسله مرة ثانية:",
+                        reply_markup=XFER_CANCEL)
+            return True
+        if target.banned:
+            await reply(update, "ما تقدر تحوّل لهذا الحساب. أرسل آيدي ثاني:",
+                        reply_markup=XFER_CANCEL)
+            return True
+        name = target.first_name or str(to_id)
+        step.update(step="amount", to=to_id, name=name, at=time.monotonic())
+        await reply(update, f"🔄 تحويل إلى: <b>{esc(name)}</b>\n🆔: <code>{to_id}</code>\n\n"
+                            f"رصيدك: {s.money(await _balance(s, tg_id))}\n"
+                            "أرسل المبلغ اللي تبي تحوّله:", reply_markup=XFER_CANCEL)
+        return True
+
+    # step == "amount"
+    try:
+        amount = parse_user_amount(text.split()[0] if text else "")
+    except InvalidAmount:
+        await reply(update, "مبلغ غير صالح. اكتب رقم، مثل <code>20</code>:", reply_markup=XFER_CANCEL)
+        return True
+    if amount < cfg.transfer_min:
+        await reply(update, f"أقل مبلغ للتحويل {s.money(cfg.transfer_min)}", reply_markup=XFER_CANCEL)
+        return True
+    if amount > cfg.transfer_max:
+        await reply(update, f"أعلى مبلغ للتحويل {s.money(cfg.transfer_max)}", reply_markup=XFER_CANCEL)
+        return True
+    balance = await _balance(s, tg_id)
+    if balance < amount:
+        await reply(update, f"رصيدك ما يكفي. رصيدك {s.money(balance)}\nأرسل مبلغ أقل:",
+                    reply_markup=XFER_CANCEL)
+        return True
+    nonce = secrets.token_hex(4)
+    context.user_data.pop("xfer", None)
+    context.user_data["xfer_op"] = {"id": nonce, "tid": uuid.uuid4().hex, "to": step["to"],
+                                    "name": step["name"], "amount": str(amount)}
+    await reply(update, "⚠️ <b>تأكيد التحويل</b>\n\n"
+                        f"إلى: {esc(step['name'])} (<code>{step['to']}</code>)\n"
+                        f"المبلغ: <b>{s.money(amount)}</b>\n"
+                        f"رصيدك بعد التحويل: {s.money(balance - amount)}\n\n"
+                        "تأكد من الاسم، التحويل ما يتلغى بعد التأكيد.\n"
+                        "يوصل لصديقك بعد موافقة المالك.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ تأكيد التحويل", callback_data=f"t:ok:{nonce}"),
+                    InlineKeyboardButton("❌ إلغاء", callback_data="t:x")]]))
+    return True
+
+
+async def transfer_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """t:x (cancel) and t:ok:<nonce> (confirm)."""
+    s = svc(context)
+    q = update.callback_query
+    if q.data == "t:x":
+        _clear_transfer(context)
+        await q.answer()
+        await _show(update, "تم إلغاء التحويل.", home_markup())
+        return
+    op = context.user_data.get("xfer_op")
+    if not op or op["id"] != q.data[len("t:ok:"):]:
+        await q.answer("انتهت صلاحية التحويل، ابدأ من جديد.", show_alert=True)
+        return
+    context.user_data.pop("xfer_op", None)  # before any await: a double tap finds nothing
+    if not await s.runtime.transfers_enabled():
+        await q.answer("🔜 التحويل لصديق متوقف حالياً.", show_alert=True)
+        return
+    await q.answer()
+    tg_id = update.effective_user.id
+    amount = Decimal(op["amount"])
+    try:
+        transfer, new_balance, created = await s.repo.create_transfer(
+            op["tid"], tg_id, op["to"], amount, _riyadh_day(), s.settings.transfers_per_day)
+    except InsufficientFunds as exc:
+        await _show(update, f"رصيدك ما يكفي. رصيدك {s.money(exc.balance)}",
+                    home_markup([TOPUP_BUTTON]))
+        return
+    except TransferLimit:
+        await _show(update, f"وصلت حد التحويلات اليومي ({s.settings.transfers_per_day}). "
+                            "جرّب بكرة.", home_markup())
+        return
+    except (TransferNotAllowed, UserBanned):
+        await _show(update, "ما تقدر تحوّل لهذا الحساب.", home_markup())
+        return
+    if not created:
+        return
+    sender_name = update.effective_user.first_name or str(tg_id)
+    await s.repo.log_user(tg_id, "transfer_requested", f"{transfer.id} -> {op['to']} {amount}")
+    await _show(update, f"✅ تم التحويل\n{PENDING_LINE}\n\n"
+                        f"حوّلت {s.money(amount)} إلى {esc(op['name'])}\n"
+                        f"رصيدك الحالي: {s.money(new_balance)}", home_markup())
+    try:
+        await context.bot.send_message(
+            op["to"], f"💰 وصلك تحويل!\n{PENDING_LINE}\n\n"
+                      f"من: {esc(sender_name)}\nالمبلغ: {s.money(amount)}\n"
+                      "يوصل لمحفظتك أول ما يوافق المالك.",
+            parse_mode="HTML", reply_markup=home_markup())
+    except Exception as exc:
+        log.info("Could not notify transfer receiver: %s", exc)
+    await owner.notify_new_transfer(context, transfer, tg_id, sender_name, op["to"], op["name"])

@@ -94,6 +94,7 @@ def build_app(settings: Settings, store: Store | None = None, api: G4SClient | N
     app.add_handler(CommandHandler("logs", owner.logs))
 
     app.add_handler(CallbackQueryHandler(user.menu, pattern=r"^m:(home|shop|bal|top|acc|ord|led|xfer)$"))
+    app.add_handler(CallbackQueryHandler(user.transfer_button, pattern=r"^t:(x|ok:[0-9a-f]{8})$"))
     app.add_handler(CallbackQueryHandler(user.categories, pattern=r"^c:\d+$"))
     app.add_handler(CallbackQueryHandler(user.category, pattern=r"^k:[0-9a-f]{10}:\d+$"))
     app.add_handler(CallbackQueryHandler(user.product, pattern=r"^p:\d+$"))

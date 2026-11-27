@@ -80,6 +80,11 @@ class Settings:
     actions_per_minute: int = 30
     orders_per_minute: int = 5
 
+    # Customer-to-customer wallet transfers (each one waits for owner approval).
+    transfer_min: Decimal = Decimal("4")
+    transfer_max: Decimal = Decimal("200")
+    transfers_per_day: int = 10
+
     order_poll_seconds: int = 60
     balance_check_seconds: int = 600
 
@@ -125,6 +130,9 @@ def load_settings() -> Settings:
         support_contact=os.environ.get("SUPPORT_CONTACT", "").strip(),
         actions_per_minute=_int("ACTIONS_PER_MINUTE", 30),
         orders_per_minute=_int("ORDERS_PER_MINUTE", 5),
+        transfer_min=_decimal("TRANSFER_MIN", "4"),
+        transfer_max=_decimal("TRANSFER_MAX", "200"),
+        transfers_per_day=_int("TRANSFERS_PER_DAY", 10),
         order_poll_seconds=_int("ORDER_POLL_SECONDS", 60),
         balance_check_seconds=_int("BALANCE_CHECK_SECONDS", 600),
     )
