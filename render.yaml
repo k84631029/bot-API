@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: bot-api
+    runtime: python
+    # Paid plan: the free plan sleeps, which delays replies and stops the
+    # background job that follows up on pending orders.
+    plan: starter
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m bot.main
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.1
+      - key: BOT_TOKEN
+        sync: false
+      - key: G4S_API_TOKEN
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      - key: ENCRYPTION_KEYS
+        sync: false
+      - key: HMAC_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: FIREBASE_CREDENTIALS_JSON
+        sync: false
+      - key: G4S_PROXY_URL
+        sync: false
+      - key: SUPPORT_CONTACT
+        sync: false
+      - key: DEFAULT_MARGIN_PERCENT
+        value: "10"
+      - key: LOW_PROVIDER_BALANCE
+        value: "20"
+      - key: CURRENCY_SYMBOL
+        value: "$"
