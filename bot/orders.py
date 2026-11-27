@@ -78,6 +78,8 @@ class OrderService:
                 raise OrderRejectedBeforeDebit("رقم الطلب غير صالح")
             return PlaceResult(existing, duplicate=True)
 
+        if not await self.runtime.is_visible(product_id):
+            raise OrderRejectedBeforeDebit("المنتج غير متوفر حالياً")
         try:
             product = await self.catalog.fresh_product(product_id)
         except (G4SError, G4SUnavailable) as exc:

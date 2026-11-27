@@ -23,11 +23,16 @@ class Category:
 
 
 class Catalog:
+    """Cached provider catalog.
+
+    Customers see only products that are available AND that the owner made
+    visible. The owner's product manager sees every product.
+    """
+
     def __init__(self, api: G4SClient, ttl_seconds: int = 300):
         self.api = api
         self.ttl = ttl_seconds
         self._products: dict[int, Product] = {}
-        self._categories: list[Category] = []
         self._loaded_at = 0.0
 
     async def _refresh(self, force: bool = False) -> None:
@@ -35,23 +40,31 @@ class Catalog:
             return
         products = await self.api.products()
         self._products = {p.id: p for p in products}
+        self._loaded_at = time.monotonic()
+
+    @staticmethod
+    def _group(products) -> list[Category]:
         grouped: dict[str, list[Product]] = {}
         for p in products:
-            if p.available:
-                grouped.setdefault(p.category_name, []).append(p)
-        self._categories = [
+            grouped.setdefault(p.category_name, []).append(p)
+        return [
             Category(category_key(name), name, sorted(items, key=lambda p: (p.price, p.name)))
             for name, items in sorted(grouped.items())
         ]
-        self._loaded_at = time.monotonic()
 
-    async def categories(self) -> list[Category]:
-        await self._refresh()
-        return self._categories
+    def _pick(self, visible: frozenset[int] | None):
+        """visible=None -> every product (owner manager); otherwise only
+        available products whose id is in `visible` (customers)."""
+        if visible is None:
+            return self._products.values()
+        return [p for p in self._products.values() if p.available and p.id in visible]
 
-    async def category(self, key: str) -> Category | None:
+    async def categories(self, visible: frozenset[int] | None = None) -> list[Category]:
         await self._refresh()
-        return next((c for c in self._categories if c.key == key), None)
+        return self._group(self._pick(visible))
+
+    async def category(self, key: str, visible: frozenset[int] | None = None) -> Category | None:
+        return next((c for c in await self.categories(visible) if c.key == key), None)
 
     async def product(self, product_id: int) -> Product | None:
         await self._refresh()
@@ -105,6 +118,13 @@ class RuntimeSettings:
     async def margin(self) -> Decimal:
         raw = (await self._get()).get("margin_percent")
         return to_decimal(raw) if raw is not None else self.default_margin
+
+    async def visible_products(self) -> frozenset[int]:
+        """Product IDs the owner allowed customers to see. Empty = none."""
+        return frozenset(int(i) for i in (await self._get()).get("visible_products") or [])
+
+    async def is_visible(self, product_id: int) -> bool:
+        return product_id in await self.visible_products()
 
     async def price(self, product: Product, qty: int) -> Decimal:
         return sell_total(product.price, qty, await self.margin())

@@ -410,3 +410,20 @@ class Repo:
 
     async def update_settings(self, **fields) -> None:
         await self.store.merge(SETTINGS, "global", fields)
+
+    async def set_products_visible(self, product_ids, visible: bool) -> frozenset[int]:
+        """Show or hide products for customers. Returns the new visible set.
+
+        Runs in a transaction so two owners toggling at once don't overwrite
+        each other's changes.
+        """
+        ids = {int(i) for i in product_ids}
+
+        async def fn(tx: Tx):
+            doc = await tx.get(SETTINGS, "global") or {}
+            current = {int(i) for i in doc.get("visible_products") or []}
+            current = current | ids if visible else current - ids
+            tx.merge(SETTINGS, "global", {"visible_products": sorted(current)})
+            return frozenset(current)
+
+        return await self.store.run_transaction(fn)

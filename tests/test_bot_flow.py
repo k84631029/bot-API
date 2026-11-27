@@ -111,6 +111,7 @@ class Harness:
 async def h():
     harness = Harness()
     await harness.app.initialize()
+    await harness.svc.repo.set_products_visible([18, 365], True)
     yield harness
     await harness.app.shutdown()
 
@@ -212,3 +213,55 @@ async def test_insufficient_balance_message(h):
     await h.press(CUSTOMER, confirm["callback_data"])
     assert "رصيدك ما يكفي" in h.tg.last_text(CUSTOMER)
     assert h.g4s.orders == {}
+
+
+async def test_customers_see_only_visible_products(h):
+    await h.svc.repo.set_products_visible([365], False)
+    h.svc.runtime.invalidate()
+    await h.text(CUSTOMER, "🛒 المنتجات")
+    names = [b["text"] for b in h.tg.last_buttons(CUSTOMER)]
+    assert names == ["PUBG Global ID UC"]  # category "UC 60" (only product 365) is gone
+
+    await h.press(CUSTOMER, "p:365")  # old or crafted button
+    assert "غير متوفر" in h.tg.last_text(CUSTOMER)
+
+    await h.svc.repo.set_products_visible([18], False)
+    h.svc.runtime.invalidate()
+    await h.text(CUSTOMER, "🛒 المنتجات")
+    assert "ما فيه منتجات" in h.tg.last_text(CUSTOMER)
+
+
+async def test_owner_toggles_product_visibility(h):
+    await h.svc.repo.set_products_visible([18, 365], False)
+    h.svc.runtime.invalidate()
+    await h.text(OWNER, "/products")
+    cats = h.tg.last_buttons(OWNER)
+    pubg = next(b for b in cats if "PUBG Global ID UC" in b["text"])
+    assert pubg["text"].startswith("⬜")
+
+    await h.press(OWNER, pubg["callback_data"])
+    toggle = next(b for b in h.tg.last_buttons(OWNER) if b["callback_data"].endswith(":18"))
+    assert toggle["text"].startswith("⬜")
+    await h.press(OWNER, toggle["callback_data"])
+    assert await h.svc.runtime.visible_products() == frozenset({18})
+    toggle = next(b for b in h.tg.last_buttons(OWNER) if b["callback_data"].endswith(":18"))
+    assert toggle["text"].startswith("✅")
+
+    await h.text(CUSTOMER, "🛒 المنتجات")
+    assert [b["text"] for b in h.tg.last_buttons(CUSTOMER)] == ["PUBG Global ID UC"]
+
+    hide_all = next(b for b in h.tg.last_buttons(OWNER) if b["callback_data"].endswith(":0")
+                    and b["callback_data"].startswith("a:pa:"))
+    await h.press(OWNER, hide_all["callback_data"])
+    assert await h.svc.runtime.visible_products() == frozenset()
+    logs = [a for _, _, a, _ in await h.svc.repo.owner_logs()]
+    assert "product_show" in logs and "category_hide" in logs
+
+
+async def test_customer_cannot_toggle_visibility(h):
+    await h.text(CUSTOMER, "/start")
+    key = next(iter(await h.svc.catalog.categories())).key
+    await h.press(CUSTOMER, f"a:pa:{key}:0:0")
+    await h.press(CUSTOMER, f"a:pt:{key}:0:365")
+    h.svc.runtime.invalidate()
+    assert await h.svc.runtime.visible_products() == frozenset({18, 365})  # unchanged

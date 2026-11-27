@@ -51,6 +51,7 @@ class Env:
 @pytest.fixture
 async def env():
     e = Env()
+    await e.repo.set_products_visible([18, 365], True)
     await e.user()
     yield e
     await e.api.aclose()
@@ -199,3 +200,19 @@ async def test_copying_balance_between_users_fails(env):
     users[env.repo.user_hash(OTHER)]["balance_enc"] = users[env.repo.user_hash(USER)]["balance_enc"]
     with pytest.raises(DecryptionError):
         await env.repo.get_user(OTHER)
+
+
+async def test_hidden_product_cannot_be_ordered(env):
+    await env.repo.set_products_visible([18], False)
+    env.runtime.invalidate()
+    with pytest.raises(OrderRejectedBeforeDebit):
+        await env.place()
+    assert await env.balance() == Decimal("10")
+    assert env.fake.orders == {}
+
+
+async def test_visibility_toggles_are_merged(env):
+    await env.repo.set_products_visible([18, 365], False)
+    assert await env.repo.set_products_visible([18], True) == frozenset({18})
+    assert await env.repo.set_products_visible([365], True) == frozenset({18, 365})
+    assert await env.repo.set_products_visible([18], False) == frozenset({365})

@@ -7,6 +7,7 @@ import logging
 import re
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from ..g4s import G4SError, G4SUnavailable
@@ -16,6 +17,8 @@ from .common import esc, order_text, reply, svc, when
 
 log = logging.getLogger(__name__)
 UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+CAT_KEY_RE = re.compile(r"^[0-9a-f]{10}$")
+PV_PAGE = 10
 
 HELP = """🛠 <b>لوحة المالك</b>
 
@@ -23,6 +26,7 @@ HELP = """🛠 <b>لوحة المالك</b>
 <code>/debit ID المبلغ [ملاحظة]</code> — خصم من رصيد عميل
 <code>/user ID</code> — معلومات عميل وآخر طلباته
 <code>/ban ID</code> و <code>/unban ID</code>
+<code>/products</code> — اختيار المنتجات اللي تظهر للعملاء
 <code>/margin النسبة</code> — نسبة الربح (مثال 10)
 <code>/maintenance on|off</code> — وضع الصيانة
 <code>/order UUID</code> — تفاصيل طلب
@@ -57,6 +61,7 @@ async def _audit(context, update: Update, action: str, details: str) -> None:
 def _panel_markup(maintenance: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 رصيدي عند المزود", callback_data="a:bal")],
+        [InlineKeyboardButton("🧩 المنتجات المعروضة", callback_data="a:pv:0")],
         [InlineKeyboardButton("📋 الطلبات المعلّقة", callback_data="a:open")],
         [InlineKeyboardButton("🟢 إيقاف الصيانة" if maintenance else "🔴 تشغيل الصيانة",
                               callback_data="a:mt")],
@@ -70,7 +75,9 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     maintenance = await s.runtime.maintenance()
     margin = await s.runtime.margin()
     status = "🔴 مفعّل" if maintenance else "🟢 البيع شغّال"
-    await reply(update, f"{HELP}\n\nالصيانة: {status}\nنسبة الربح: {margin}%",
+    shown = len(await s.runtime.visible_products())
+    await reply(update, f"{HELP}\n\nالصيانة: {status}\nنسبة الربح: {margin}%"
+                        f"\nالمنتجات المعروضة للعملاء: {shown}",
                 reply_markup=_panel_markup(maintenance))
 
 
@@ -78,7 +85,11 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def panel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    action = q.data.split(":")[1]
+    parts = q.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action in {"pv", "pk", "pt", "pa"}:
+        await _products_button(update, context, action, parts[2:])
+        return
     if action == "bal":
         await provider_balance(update, context)
     elif action == "open":
@@ -327,3 +338,144 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines += [f"{when(at)} | {owner} | {esc(action)} | {esc(details)}"
               for at, owner, action, details in entries]
     await reply(update, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Which products customers can see
+# ---------------------------------------------------------------------------
+@owner_only
+async def products_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _pv_categories(update, context, 0)
+
+
+async def _products_button(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           action: str, args: list[str]) -> None:
+    """Callback data:
+      a:pv:<page>                       categories
+      a:pk:<cat>:<page>                 products of a category
+      a:pt:<cat>:<page>:<product_id>    toggle one product
+      a:pa:<cat>:<page>:<1|0>           show/hide the whole category
+    """
+    try:
+        if action == "pv":
+            await _pv_categories(update, context, int(args[0]))
+            return
+        key, page = args[0], int(args[1])
+        if not CAT_KEY_RE.match(key) or page < 0:
+            return
+        if action == "pk":
+            await _pv_category(update, context, key, page)
+        elif action == "pt":
+            await _pv_toggle(update, context, key, page, int(args[2]))
+        elif action == "pa" and args[2] in {"0", "1"}:
+            await _pv_whole_category(update, context, key, page, args[2] == "1")
+    except (IndexError, ValueError):
+        return
+    except (G4SError, G4SUnavailable) as exc:
+        log.warning("Catalog load failed: %s", exc)
+        await reply(update, "تعذّر تحميل المنتجات من game4station الحين، جرّب بعد شوي.")
+
+
+async def _edit_or_reply(update: Update, text: str, markup: InlineKeyboardMarkup) -> None:
+    q = update.callback_query
+    if q and q.message:
+        try:
+            await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+            return
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return
+    await reply(update, text, reply_markup=markup)
+
+
+def _nav(prefix: str, page: int, total: int) -> list[InlineKeyboardButton]:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"{prefix}:{page - 1}"))
+    if (page + 1) * PV_PAGE < total:
+        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"{prefix}:{page + 1}"))
+    return nav
+
+
+async def _pv_categories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+    s = svc(context)
+    try:
+        cats = await s.catalog.categories()  # every product, visible or not
+    except (G4SError, G4SUnavailable) as exc:
+        log.warning("Catalog load failed: %s", exc)
+        await reply(update, "تعذّر تحميل المنتجات من game4station الحين، جرّب بعد شوي.")
+        return
+    if not cats:
+        await reply(update, "ما فيه منتجات عند المزود.")
+        return
+    visible = await s.runtime.visible_products()
+    rows = []
+    for c in cats[page * PV_PAGE:(page + 1) * PV_PAGE]:
+        on = sum(1 for p in c.products if p.id in visible)
+        mark = "✅" if on == len(c.products) else ("🟡" if on else "⬜")
+        rows.append([InlineKeyboardButton(f"{mark} {c.name[:45]} ({on}/{len(c.products)})",
+                                          callback_data=f"a:pk:{c.key}:0")])
+    if nav := _nav("a:pv", page, len(cats)):
+        rows.append(nav)
+    shown = sum(1 for c in cats for p in c.products if p.id in visible)
+    text = ("🧩 <b>المنتجات المعروضة للعملاء</b>\n"
+            f"المعروض الحين: {shown} منتج\n\n"
+            "✅ كل القسم ظاهر  🟡 بعضه  ⬜ مخفي\nاختر القسم:")
+    await _edit_or_reply(update, text, InlineKeyboardMarkup(rows))
+
+
+async def _pv_category(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str,
+                       page: int) -> None:
+    s = svc(context)
+    cat = await s.catalog.category(key)
+    if cat is None:
+        await _pv_categories(update, context, 0)
+        return
+    visible = await s.runtime.visible_products()
+    rows = []
+    for p in cat.products[page * PV_PAGE:(page + 1) * PV_PAGE]:
+        mark = "✅" if p.id in visible else "⬜"
+        min_qty = p.qty.choices[0] if p.qty.kind == "choices" else p.qty.min
+        price = await s.runtime.price(p, min_qty)
+        na = " ⛔" if not p.available else ""
+        rows.append([InlineKeyboardButton(f"{mark} {p.name[:35]} — {s.money(price)}{na}",
+                                          callback_data=f"a:pt:{key}:{page}:{p.id}")])
+    rows.append([InlineKeyboardButton("✅ إظهار الكل", callback_data=f"a:pa:{key}:{page}:1"),
+                 InlineKeyboardButton("⬜ إخفاء الكل", callback_data=f"a:pa:{key}:{page}:0")])
+    if nav := _nav(f"a:pk:{key}", page, len(cat.products)):
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 الأقسام", callback_data="a:pv:0")])
+    text = (f"🧩 <b>{esc(cat.name)}</b>\n"
+            "اضغط على المنتج عشان تظهره للعملاء أو تخفيه.\n✅ ظاهر  ⬜ مخفي")
+    if any(not p.available for p in cat.products):
+        text += "\n⛔ غير متوفر عند المزود (ما يظهر للعملاء لين يتوفر)"
+    await _edit_or_reply(update, text, InlineKeyboardMarkup(rows))
+
+
+async def _pv_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, page: int,
+                     product_id: int) -> None:
+    s = svc(context)
+    product = await s.catalog.product(product_id)
+    if product is None:
+        await _pv_category(update, context, key, page)
+        return
+    s.runtime.invalidate()  # decide from the latest saved state, not the cache
+    show = not await s.runtime.is_visible(product_id)
+    await s.repo.set_products_visible([product_id], show)
+    s.runtime.invalidate()
+    await _audit(context, update, "product_show" if show else "product_hide",
+                 f"{product_id} {product.name}")
+    await _pv_category(update, context, key, page)
+
+
+async def _pv_whole_category(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str,
+                             page: int, show: bool) -> None:
+    s = svc(context)
+    cat = await s.catalog.category(key)
+    if cat is None:
+        await _pv_categories(update, context, 0)
+        return
+    await s.repo.set_products_visible([p.id for p in cat.products], show)
+    s.runtime.invalidate()
+    await _audit(context, update, "category_show" if show else "category_hide", cat.name)
+    await _pv_category(update, context, key, page)

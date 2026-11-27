@@ -77,6 +77,7 @@ def build_app(settings: Settings, store: Store | None = None, api: G4SClient | N
     app.add_handler(CommandHandler("user", owner.user_info))
     app.add_handler(CommandHandler("ban", owner.ban))
     app.add_handler(CommandHandler("unban", owner.unban))
+    app.add_handler(CommandHandler("products", owner.products_cmd))
     app.add_handler(CommandHandler("margin", owner.margin))
     app.add_handler(CommandHandler("maintenance", owner.maintenance))
     app.add_handler(CommandHandler("order", owner.order_info))

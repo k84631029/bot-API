@@ -153,7 +153,7 @@ async def categories(update: Update, context: ContextTypes.DEFAULT_TYPE, page: i
         page = int(update.callback_query.data.split(":")[1])
     context.user_data.pop("draft", None)
     try:
-        cats = await s.catalog.categories()
+        cats = await s.catalog.categories(await s.runtime.visible_products())
     except (G4SError, G4SUnavailable) as exc:
         log.warning("Catalog load failed: %s", exc)
         await reply(update, "تعذّر تحميل المنتجات الحين، جرّب بعد شوي.")
@@ -174,7 +174,12 @@ async def category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     _, key, page = q.data.split(":")
     page = int(page)
-    cat = await s.catalog.category(key)
+    try:
+        cat = await s.catalog.category(key, await s.runtime.visible_products())
+    except (G4SError, G4SUnavailable) as exc:
+        log.warning("Catalog load failed: %s", exc)
+        await reply(update, "تعذّر تحميل المنتجات الحين، جرّب بعد شوي.")
+        return
     if cat is None:
         await categories(update, context)
         return
@@ -197,7 +202,7 @@ async def product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
     p = await s.catalog.product(int(q.data.split(":")[1]))
-    if p is None or not p.available:
+    if p is None or not p.available or not await s.runtime.is_visible(p.id):
         await reply(update, "المنتج غير متوفر حالياً.")
         return
     context.user_data["draft"] = {"product_id": p.id, "values": [], "qty": None,
@@ -291,7 +296,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     reply_markup=main_keyboard(s.is_owner(update.effective_user.id)))
         return
     p = await s.catalog.product(draft["product_id"])
-    if p is None:
+    if p is None or not await s.runtime.is_visible(p.id):
         context.user_data.pop("draft", None)
         await reply(update, "المنتج غير متوفر حالياً.")
         return
