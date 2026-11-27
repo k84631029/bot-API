@@ -12,6 +12,7 @@ from ..g4s import G4SError, G4SUnavailable, Product
 from ..money import to_decimal
 from ..orders import OrderRejectedBeforeDebit, PriceChanged
 from ..repo import InsufficientFunds, UserBanned
+from . import owner
 from .common import (BTN_BALANCE, BTN_LEDGER, BTN_ORDERS, BTN_PRODUCTS, BTN_TOPUP, LEDGER_LABELS,
                      STATUS_LABELS, esc, main_keyboard, order_text, reply, svc, when)
 
@@ -286,7 +287,10 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     routes = {BTN_PRODUCTS: categories, BTN_BALANCE: balance, BTN_ORDERS: my_orders,
               BTN_LEDGER: ledger, BTN_TOPUP: topup}
     if text in routes:
+        context.user_data.pop("owner_step", None)  # a menu tap cancels an owner prompt
         await routes[text](update, context)
+        return
+    if await owner.handle_text(update, context):
         return
 
     s = svc(context)

@@ -5,13 +5,16 @@ from __future__ import annotations
 import functools
 import logging
 import re
+import secrets
+import time
+from decimal import Decimal
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from ..g4s import G4SError, G4SUnavailable
-from ..money import InvalidAmount, parse_user_amount, to_decimal
+from ..money import InvalidAmount, parse_user_amount, sell_total, to_decimal
 from ..repo import InsufficientFunds, UserNotFound
 from .common import esc, order_text, reply, svc, when
 
@@ -20,19 +23,17 @@ UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 CAT_KEY_RE = re.compile(r"^[0-9a-f]{10}$")
 PV_PAGE = 10
 
-HELP = """🛠 <b>لوحة المالك</b>
+COMMANDS_HELP = """<b>الأوامر</b> (اختيارية، الأزرار تسوي نفس الشي)
+<code>/credit ID المبلغ [ملاحظة]</code> · <code>/debit ID المبلغ</code>
+<code>/user ID</code> · <code>/ban ID</code> · <code>/unban ID</code>
+<code>/products</code> · <code>/margin 10</code> · <code>/maintenance on|off</code>
+<code>/order UUID</code> · <code>/refund UUID</code> · <code>/recheck</code> · <code>/logs</code>"""
 
-<code>/credit ID المبلغ [ملاحظة]</code> — شحن رصيد عميل
-<code>/debit ID المبلغ [ملاحظة]</code> — خصم من رصيد عميل
-<code>/user ID</code> — معلومات عميل وآخر طلباته
-<code>/ban ID</code> و <code>/unban ID</code>
-<code>/products</code> — اختيار المنتجات اللي تظهر للعملاء
-<code>/margin النسبة</code> — نسبة الربح (مثال 10)
-<code>/maintenance on|off</code> — وضع الصيانة
-<code>/order UUID</code> — تفاصيل طلب
-<code>/refund UUID</code> — استرجاع يدوي لطلب معلّق
-<code>/recheck</code> — تحقق الآن من الطلبات المعلّقة
-<code>/logs</code> — سجل المالك"""
+# How long a "send me the ID / amount" prompt stays active.
+STEP_TTL_SECONDS = 600
+MARGIN_PRESETS = ("5", "8", "10", "12", "15", "20", "25", "30")
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٫", "0123456789.")
+
 
 
 def owner_only(fn):
@@ -48,7 +49,7 @@ def owner_only(fn):
 
 
 def _parse_tg_id(raw: str) -> int:
-    raw = raw.strip()
+    raw = raw.strip().translate(_AR_DIGITS)
     if not raw.isdigit():
         raise ValueError
     return int(raw)
@@ -59,25 +60,34 @@ async def _audit(context, update: Update, action: str, details: str) -> None:
 
 
 def _panel_markup(maintenance: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardButton
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 رصيدي عند المزود", callback_data="a:bal")],
-        [InlineKeyboardButton("🧩 المنتجات المعروضة", callback_data="a:pv:0")],
-        [InlineKeyboardButton("📋 الطلبات المعلّقة", callback_data="a:open")],
-        [InlineKeyboardButton("🟢 إيقاف الصيانة" if maintenance else "🔴 تشغيل الصيانة",
-                              callback_data="a:mt")],
-        [InlineKeyboardButton("📜 سجل المالك", callback_data="a:logs")],
+        [b("💰 شحن رصيد عميل", callback_data="a:cr"), b("➖ خصم من عميل", callback_data="a:db")],
+        [b("👤 إدارة عميل", callback_data="a:us")],
+        [b("🧩 المنتجات المعروضة", callback_data="a:pv:0"), b("📈 نسبة الربح", callback_data="a:mg")],
+        [b("📋 الطلبات المعلّقة", callback_data="a:open"), b("🔍 بحث عن طلب", callback_data="a:od")],
+        [b("💳 رصيدي عند المزود", callback_data="a:bal"),
+         b("🔄 تحقق من المعلّقة", callback_data="a:rc")],
+        [b("🟢 إيقاف الصيانة" if maintenance else "🔴 تشغيل الصيانة", callback_data="a:mt"),
+         b("📜 سجل المالك", callback_data="a:logs")],
+        [b("❔ الأوامر", callback_data="a:help")],
     ])
+
+
+CANCEL_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data="a:cx")]])
 
 
 @owner_only
 async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
+    _clear_step(context)
     maintenance = await s.runtime.maintenance()
     margin = await s.runtime.margin()
-    status = "🔴 مفعّل" if maintenance else "🟢 البيع شغّال"
+    status = "🔴 مفعّلة (البيع متوقف)" if maintenance else "🟢 البيع شغّال"
     shown = len(await s.runtime.visible_products())
-    await reply(update, f"{HELP}\n\nالصيانة: {status}\nنسبة الربح: {margin}%"
-                        f"\nالمنتجات المعروضة للعملاء: {shown}",
+    await reply(update, "🛠 <b>لوحة المالك</b>\n\n"
+                        f"الحالة: {status}\nنسبة الربح: {margin}%\n"
+                        f"المنتجات المعروضة للعملاء: {shown}\n\nاختر من الأزرار:",
                 reply_markup=_panel_markup(maintenance))
 
 
@@ -90,6 +100,10 @@ async def panel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if action in {"pv", "pk", "pt", "pa"}:
         await _products_button(update, context, action, parts[2:])
         return
+    arg = parts[2] if len(parts) > 2 else ""
+    if action in _BUTTONS:
+        await _BUTTONS[action](update, context, arg)
+        return
     if action == "bal":
         await provider_balance(update, context)
     elif action == "open":
@@ -101,8 +115,8 @@ async def panel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await q.edit_message_reply_markup(_panel_markup(new))
     elif action == "logs":
         await logs(update, context)
-    elif action == "rf":
-        await _do_refund(update, context, q.data.split(":", 2)[2])
+    elif action == "rf" and UUID_RE.match(arg):
+        await _do_refund(update, context, arg)
 
 
 async def provider_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -121,11 +135,12 @@ async def open_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not orders:
         await reply(update, "ما فيه طلبات معلّقة ✅")
         return
-    lines = [f"📋 <b>الطلبات المعلّقة ({len(orders)})</b>"]
-    for o in orders:
-        lines.append(f"• <code>{o.uuid}</code> {esc(o.product_name)} — {o.status} "
-                     f"(محاولات {o.attempts}) {when(o.created_at)}")
-    await reply(update, "\n".join(lines))
+    rows = [[InlineKeyboardButton(
+        f"{o.product_name[:25]} — {o.status} — {when(o.created_at)}",
+        callback_data=f"a:oi:{o.uuid}")] for o in orders]
+    await reply(update, f"📋 <b>الطلبات المعلّقة ({len(orders)})</b>\n"
+                        "اضغط على الطلب لتفاصيله أو لاسترجاع المبلغ:",
+                reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def _set_maintenance(update, context, on: bool) -> None:
@@ -152,12 +167,22 @@ async def margin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply(update, f"النسبة الحالية: {await s.runtime.margin()}%\nالاستخدام: <code>/margin 10</code>")
         return
     try:
-        value = to_decimal(context.args[0])
-        if value < 0 or value > 500:
-            raise InvalidAmount
+        value = _parse_margin(context.args[0])
     except InvalidAmount:
         await reply(update, "نسبة غير صالحة (0 إلى 500).")
         return
+    await _set_margin(update, context, value)
+
+
+def _parse_margin(text: str) -> Decimal:
+    value = to_decimal(text.strip().translate(_AR_DIGITS).rstrip("%").strip())
+    if value < 0 or value > 500:
+        raise InvalidAmount("margin out of range")
+    return value
+
+
+async def _set_margin(update: Update, context: ContextTypes.DEFAULT_TYPE, value: Decimal) -> None:
+    s = svc(context)
     await s.repo.update_settings(margin_percent=str(value))
     s.runtime.invalidate()
     await _audit(context, update, "margin", str(value))
@@ -165,7 +190,6 @@ async def margin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _adjust(update: Update, context: ContextTypes.DEFAULT_TYPE, sign: int) -> None:
-    s = svc(context)
     cmd = "credit" if sign > 0 else "debit"
     if len(context.args) < 2:
         await reply(update, f"الاستخدام: <code>/{cmd} ID المبلغ [ملاحظة]</code>")
@@ -177,6 +201,13 @@ async def _adjust(update: Update, context: ContextTypes.DEFAULT_TYPE, sign: int)
         await reply(update, "رقم العميل أو المبلغ غير صالح (المبلغ موجب وبحد أقصى خانتين عشريتين).")
         return
     note = " ".join(context.args[2:])[:200]
+    await _apply_adjust(update, context, tg_id, amount, sign, note)
+
+
+async def _apply_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_id: int,
+                        amount: Decimal, sign: int, note: str) -> None:
+    s = svc(context)
+    cmd = "credit" if sign > 0 else "debit"
     kind = "owner_credit" if sign > 0 else "owner_debit"
     try:
         new_balance = await s.repo.adjust_balance(
@@ -216,6 +247,12 @@ async def user_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except (IndexError, ValueError):
         await reply(update, "الاستخدام: <code>/user ID</code>")
         return
+    await _user_card(update, context, tg_id)
+
+
+async def _user_card(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_id: int,
+                     edit: bool = False) -> None:
+    s = svc(context)
     user = await s.repo.get_user(tg_id)
     if user is None:
         await reply(update, "العميل غير مسجّل.")
@@ -231,7 +268,17 @@ async def user_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
     lines += [f"• {esc(o.product_name)} — {o.status} — {s.money(o.amount)} — <code>{o.uuid}</code>"
               for o in orders]
-    await reply(update, "\n".join(lines))
+    b = InlineKeyboardButton
+    markup = InlineKeyboardMarkup([
+        [b("💰 شحن", callback_data=f"a:uc:{tg_id}"), b("➖ خصم", callback_data=f"a:ud:{tg_id}")],
+        [b("✅ فك الحظر" if user.banned else "🚫 حظر", callback_data=f"a:ub:{tg_id}")],
+        [b("🔙 لوحة المالك", callback_data="a:home")],
+    ])
+    text = "\n".join(lines)
+    if edit:
+        await _edit_or_reply(update, text, markup)
+    else:
+        await reply(update, text, reply_markup=markup)
 
 
 async def _ban(update: Update, context: ContextTypes.DEFAULT_TYPE, banned: bool) -> None:
@@ -270,7 +317,12 @@ async def order_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not context.args or not UUID_RE.match(context.args[0]):
         await reply(update, "الاستخدام: <code>/order UUID</code>")
         return
-    order = await s.repo.get_order(context.args[0])
+    await _order_card(update, context, context.args[0])
+
+
+async def _order_card(update: Update, context: ContextTypes.DEFAULT_TYPE, order_uuid: str) -> None:
+    s = svc(context)
+    order = await s.repo.get_order(order_uuid)
     if order is None:
         await reply(update, "الطلب غير موجود.")
         return
@@ -279,7 +331,11 @@ async def order_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
              f"\nتكلفة متوقعة: {order.cost} | سعر المزود: {order.provider_price or '-'}"
              f"\nرقم المزود: {esc(order.provider_order_id or '-')}"
              f"\nمحاولات: {order.attempts} | آخر خطأ: {esc(order.last_error or '-')}")
-    await reply(update, order_text(order, s, detailed=True) + extra)
+    markup = None
+    if not order.is_final:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "↩️ استرجاع المبلغ للعميل", callback_data=f"a:rq:{order.uuid}")]])
+    await reply(update, order_text(order, s, detailed=True) + extra, reply_markup=markup)
 
 
 @owner_only
@@ -288,7 +344,12 @@ async def refund(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not UUID_RE.match(context.args[0]):
         await reply(update, "الاستخدام: <code>/refund UUID</code>")
         return
-    order = await s.repo.get_order(context.args[0])
+    await _refund_prompt(update, context, context.args[0])
+
+
+async def _refund_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, order_uuid: str) -> None:
+    s = svc(context)
+    order = await s.repo.get_order(order_uuid)
     if order is None:
         await reply(update, "الطلب غير موجود.")
         return
@@ -322,6 +383,10 @@ async def _do_refund(update: Update, context: ContextTypes.DEFAULT_TYPE, order_u
 
 @owner_only
 async def recheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _recheck(update, context)
+
+
+async def _recheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = svc(context)
     done = await s.orders.reconcile()
     await reply(update, f"✅ تم التحقق. طلبات اكتملت الآن: {done}")
@@ -479,3 +544,293 @@ async def _pv_whole_category(update: Update, context: ContextTypes.DEFAULT_TYPE,
     s.runtime.invalidate()
     await _audit(context, update, "category_show" if show else "category_hide", cat.name)
     await _pv_category(update, context, key, page)
+
+
+# ---------------------------------------------------------------------------
+# Button flows: the owner taps, and types only an ID or an amount when asked.
+# State lives in context.user_data (per owner, in memory):
+#   owner_step = {"kind": "user_id"|"amount"|"margin"|"order", "at": t, ...}
+#   owner_op   = {"id": nonce, "sign": ±1, "tg_id": int, "amount": str, "note": str}
+# A money change runs only after the owner taps the confirm button carrying the
+# matching nonce, and the op is removed before it runs, so a double tap can't
+# apply it twice.
+# ---------------------------------------------------------------------------
+def _set_step(context: ContextTypes.DEFAULT_TYPE, kind: str, **data) -> None:
+    context.user_data.pop("draft", None)  # drop any half-finished purchase
+    context.user_data.pop("owner_op", None)
+    context.user_data["owner_step"] = {"kind": kind, "at": time.monotonic(), **data}
+
+
+def _get_step(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    step = context.user_data.get("owner_step")
+    if step and time.monotonic() - step["at"] > STEP_TTL_SECONDS:
+        context.user_data.pop("owner_step", None)
+        return None
+    return step
+
+
+def _clear_step(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("owner_step", None)
+    context.user_data.pop("owner_op", None)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Called for free text before the customer flow. Returns True if the text
+    answered an owner prompt."""
+    user = update.effective_user
+    if user is None or not svc(context).is_owner(user.id):
+        return False
+    step = _get_step(context)
+    if not step:
+        return False
+    s = svc(context)
+    text = (update.effective_message.text or "").strip()
+    kind = step["kind"]
+
+    if kind == "user_id":
+        try:
+            tg_id = _parse_tg_id(text)
+        except ValueError:
+            await reply(update, "الآيدي لازم يكون أرقام بس. أرسله مرة ثانية:",
+                        reply_markup=CANCEL_MARKUP)
+            return True
+        target = await s.repo.get_user(tg_id)
+        if target is None:
+            await reply(update, "هذا العميل غير مسجّل. لازم يفتح البوت ويضغط /start أول.\n"
+                                "أرسل آيدي ثاني:", reply_markup=CANCEL_MARKUP)
+            return True
+        if step["then"] == "manage":
+            _clear_step(context)
+            await _user_card(update, context, tg_id)
+        else:
+            await _ask_amount(update, context, step["then"], tg_id)
+        return True
+
+    if kind == "amount":
+        parts = text.split(maxsplit=1)
+        try:
+            amount = parse_user_amount(parts[0])
+        except (IndexError, InvalidAmount):
+            await reply(update, "مبلغ غير صالح. اكتب رقم موجب، بحد أقصى خانتين بعد الفاصلة، "
+                                "مثل <code>50</code> أو <code>12.5</code>:",
+                        reply_markup=CANCEL_MARKUP)
+            return True
+        note = parts[1][:200] if len(parts) > 1 else ""
+        if step["sign"] < 0:
+            target = await s.repo.get_user(step["tg_id"])
+            if target is not None and target.balance < amount:
+                await reply(update, f"رصيد العميل ما يكفي، رصيده {s.money(target.balance)}.\n"
+                                    "أرسل مبلغ أقل:", reply_markup=CANCEL_MARKUP)
+                return True
+        await _ask_confirm(update, context, step["sign"], step["tg_id"], amount, note)
+        return True
+
+    if kind == "margin":
+        try:
+            value = _parse_margin(text)
+        except InvalidAmount:
+            await reply(update, "نسبة غير صالحة. اكتب رقم من 0 إلى 500، مثل <code>12</code>:",
+                        reply_markup=CANCEL_MARKUP)
+            return True
+        _clear_step(context)
+        await _set_margin(update, context, value)
+        return True
+
+    if kind == "order":
+        if not UUID_RE.match(text):
+            await reply(update, "رقم الطلب غير صالح. انسخه كامل من رسالة الطلب:",
+                        reply_markup=CANCEL_MARKUP)
+            return True
+        _clear_step(context)
+        await _order_card(update, context, text)
+        return True
+
+    _clear_step(context)
+    return False
+
+
+async def _ask_user(update: Update, context: ContextTypes.DEFAULT_TYPE, then: str) -> None:
+    _set_step(context, "user_id", then=then)
+    title = {"credit": "💰 شحن رصيد عميل", "debit": "➖ خصم من رصيد عميل",
+             "manage": "👤 إدارة عميل"}[then]
+    await reply(update, f"<b>{title}</b>\n\nأرسل آيدي العميل (أرقام).\n"
+                        "العميل يلقى رقمه عنده في زر «➕ شحن الرصيد».",
+                reply_markup=CANCEL_MARKUP)
+
+
+async def _ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE, then: str,
+                      tg_id: int) -> None:
+    s = svc(context)
+    target = await s.repo.get_user(tg_id)
+    if target is None:
+        await reply(update, "العميل غير مسجّل.")
+        return
+    sign = 1 if then == "credit" else -1
+    _set_step(context, "amount", sign=sign, tg_id=tg_id)
+    title = "💰 شحن رصيد" if sign > 0 else "➖ خصم من الرصيد"
+    await reply(update, f"<b>{title}</b>\n"
+                        f"العميل: {esc(target.first_name)} (<code>{tg_id}</code>)\n"
+                        f"رصيده الحالي: {s.money(target.balance)}\n\n"
+                        "أرسل المبلغ. وإذا تبي تضيف ملاحظة، اكتبها بعد المبلغ بمسافة، مثل:\n"
+                        "<code>50 تحويل بنكي</code>",
+                reply_markup=CANCEL_MARKUP)
+
+
+async def _ask_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, sign: int, tg_id: int,
+                       amount: Decimal, note: str) -> None:
+    s = svc(context)
+    context.user_data.pop("owner_step", None)
+    op_id = secrets.token_hex(4)
+    context.user_data["owner_op"] = {"id": op_id, "sign": sign, "tg_id": tg_id,
+                                     "amount": str(amount), "note": note}
+    target = await s.repo.get_user(tg_id)
+    after = (target.balance + amount * sign) if target else None
+    lines = ["⚠️ <b>تأكيد " + ("الشحن" if sign > 0 else "الخصم") + "</b>",
+             f"العميل: {esc(target.first_name if target else '')} (<code>{tg_id}</code>)",
+             f"المبلغ: <b>{'+' if sign > 0 else '-'}{s.money(amount)}</b>"]
+    if note:
+        lines.append(f"ملاحظة: {esc(note)}")
+    if after is not None:
+        lines.append(f"الرصيد بعد العملية: {s.money(after)}")
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ تأكيد", callback_data=f"a:cf:{op_id}"),
+        InlineKeyboardButton("❌ إلغاء", callback_data="a:cx"),
+    ]])
+    await reply(update, "\n".join(lines), reply_markup=markup)
+
+
+async def _remove_buttons(update: Update) -> None:
+    q = update.callback_query
+    if q and q.message:
+        try:
+            await q.edit_message_reply_markup(None)
+        except BadRequest:
+            pass
+
+
+async def _btn_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, op_id: str) -> None:
+    op = context.user_data.get("owner_op")
+    if not op or op["id"] != op_id:
+        await reply(update, "انتهت صلاحية هذي العملية، أو تنفّذت مسبقاً.")
+        return
+    context.user_data.pop("owner_op", None)  # before any await: a double tap finds nothing
+    await _remove_buttons(update)
+    await _apply_adjust(update, context, op["tg_id"], to_decimal(op["amount"]), op["sign"],
+                        op["note"])
+
+
+async def _btn_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE, _arg: str) -> None:
+    _clear_step(context)
+    await _remove_buttons(update)
+    await reply(update, "تم الإلغاء.")
+
+
+async def _btn_home(update: Update, context: ContextTypes.DEFAULT_TYPE, _arg: str) -> None:
+    await panel(update, context)
+
+
+async def _btn_help(update: Update, context: ContextTypes.DEFAULT_TYPE, _arg: str) -> None:
+    await reply(update, COMMANDS_HELP)
+
+
+async def _btn_user_action(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str,
+                           then: str) -> None:
+    try:
+        tg_id = _parse_tg_id(arg)
+    except ValueError:
+        return
+    await _ask_amount(update, context, then, tg_id)
+
+
+async def _btn_toggle_ban(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str) -> None:
+    s = svc(context)
+    try:
+        tg_id = _parse_tg_id(arg)
+    except ValueError:
+        return
+    target = await s.repo.get_user(tg_id)
+    if target is None:
+        await reply(update, "العميل غير مسجّل.")
+        return
+    banned = not target.banned
+    if banned and s.is_owner(tg_id):
+        await reply(update, "ما تقدر تحظر مالك.")
+        return
+    await s.repo.set_banned(tg_id, banned)
+    s.forget_user(tg_id)
+    await _audit(context, update, "ban" if banned else "unban", str(tg_id))
+    await _user_card(update, context, tg_id, edit=True)
+
+
+async def _margin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool) -> None:
+    s = svc(context)
+    current = await s.runtime.margin()
+    example = sell_total(Decimal("10"), 1, current)
+    buttons = [InlineKeyboardButton(("✅ " if Decimal(p) == current else "") + f"{p}%",
+                                    callback_data=f"a:ms:{p}") for p in MARGIN_PRESETS]
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    rows.append([InlineKeyboardButton("✏️ اكتب نسبة ثانية", callback_data="a:mx")])
+    rows.append([InlineKeyboardButton("🔙 لوحة المالك", callback_data="a:home")])
+    text = (f"📈 <b>نسبة الربح الحالية: {current}%</b>\n\n"
+            f"مثال: منتج سعره عند المزود {s.money(Decimal('10'))} "
+            f"يطلع للعميل بـ {s.money(example)}.\n\nاختر نسبة جديدة:")
+    markup = InlineKeyboardMarkup(rows)
+    if edit:
+        await _edit_or_reply(update, text, markup)
+    else:
+        await reply(update, text, reply_markup=markup)
+
+
+async def _btn_margin_set(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str) -> None:
+    if arg not in MARGIN_PRESETS:
+        return
+    await _set_margin(update, context, Decimal(arg))
+    await _margin_menu(update, context, edit=True)
+
+
+async def _btn_margin_custom(update: Update, context: ContextTypes.DEFAULT_TYPE, _arg: str) -> None:
+    _set_step(context, "margin")
+    await reply(update, "اكتب نسبة الربح اللي تبيها (رقم من 0 إلى 500)، مثل <code>12</code>:",
+                reply_markup=CANCEL_MARKUP)
+
+
+async def _btn_order_search(update: Update, context: ContextTypes.DEFAULT_TYPE, _arg: str) -> None:
+    _set_step(context, "order")
+    await reply(update, "🔍 أرسل رقم الطلب. تلقاه في رسالة الطلب عند العميل («رقم الطلب»):",
+                reply_markup=CANCEL_MARKUP)
+
+
+async def _btn_order_info(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str) -> None:
+    if UUID_RE.match(arg):
+        await _order_card(update, context, arg)
+
+
+async def _btn_refund_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str) -> None:
+    if UUID_RE.match(arg):
+        await _refund_prompt(update, context, arg)
+
+
+async def _btn_recheck(update: Update, context: ContextTypes.DEFAULT_TYPE, _arg: str) -> None:
+    await _recheck(update, context)
+
+
+# action -> handler(update, context, arg); `arg` is the text after "a:<action>:".
+_BUTTONS = {
+    "cr": lambda u, c, a: _ask_user(u, c, "credit"),
+    "db": lambda u, c, a: _ask_user(u, c, "debit"),
+    "us": lambda u, c, a: _ask_user(u, c, "manage"),
+    "uc": lambda u, c, a: _btn_user_action(u, c, a, "credit"),
+    "ud": lambda u, c, a: _btn_user_action(u, c, a, "debit"),
+    "ub": _btn_toggle_ban,
+    "cf": _btn_confirm,
+    "cx": _btn_cancel,
+    "home": _btn_home,
+    "help": _btn_help,
+    "mg": lambda u, c, a: _margin_menu(u, c, edit=False),
+    "ms": _btn_margin_set,
+    "mx": _btn_margin_custom,
+    "od": _btn_order_search,
+    "oi": _btn_order_info,
+    "rq": _btn_refund_prompt,
+    "rc": _btn_recheck,
+}

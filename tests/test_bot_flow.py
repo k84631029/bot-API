@@ -265,3 +265,103 @@ async def test_customer_cannot_toggle_visibility(h):
     await h.press(CUSTOMER, f"a:pt:{key}:0:365")
     h.svc.runtime.invalidate()
     assert await h.svc.runtime.visible_products() == frozenset({18, 365})  # unchanged
+
+
+async def test_owner_credit_with_buttons(h):
+    await h.text(CUSTOMER, "/start")
+    await h.press(OWNER, "a:cr")
+    assert "آيدي العميل" in h.tg.last_text(OWNER)
+    await h.text(OWNER, "abc")
+    assert "أرقام" in h.tg.last_text(OWNER)
+    await h.text(OWNER, str(STRANGER))  # never pressed /start
+    assert "غير مسجّل" in h.tg.last_text(OWNER)
+    await h.text(OWNER, str(CUSTOMER))
+    assert "أرسل المبلغ" in h.tg.last_text(OWNER)
+    await h.text(OWNER, "-5")
+    assert "مبلغ غير صالح" in h.tg.last_text(OWNER)
+    await h.text(OWNER, "٢٥ تحويل بنكي")  # Arabic digits + note
+    assert "تأكيد الشحن" in h.tg.last_text(OWNER)
+    assert (await h.svc.repo.get_user(CUSTOMER)).balance == Decimal("0")  # not before confirm
+
+    confirm = next(b for b in h.tg.last_buttons(OWNER) if b["callback_data"].startswith("a:cf:"))
+    await h.press(OWNER, confirm["callback_data"])
+    assert (await h.svc.repo.get_user(CUSTOMER)).balance == Decimal("25")
+    assert "25.00" in h.tg.last_text(CUSTOMER)  # customer notified
+
+    await h.press(OWNER, confirm["callback_data"])  # double tap
+    assert (await h.svc.repo.get_user(CUSTOMER)).balance == Decimal("25")
+    assert "انتهت صلاحية" in h.tg.last_text(OWNER)
+    ledger = await h.svc.repo.ledger_for_user(CUSTOMER)
+    assert [(e.type, e.note) for e in ledger] == [("owner_credit", "تحويل بنكي")]
+
+
+async def test_owner_debit_cancel_and_insufficient(h):
+    await h.text(CUSTOMER, "/start")
+    await h.press(OWNER, "a:db")
+    await h.text(OWNER, str(CUSTOMER))
+    await h.press(OWNER, "a:cx")
+    assert "تم الإلغاء" in h.tg.last_text(OWNER)
+    await h.text(OWNER, "5")  # prompt is gone: plain text no longer means an amount
+    assert "اختر من القائمة" in h.tg.last_text(OWNER)
+
+    await h.press(OWNER, "a:db")
+    await h.text(OWNER, str(CUSTOMER))
+    await h.text(OWNER, "5")
+    assert "ما يكفي" in h.tg.last_text(OWNER)  # no confirm button offered
+    assert not any(b["callback_data"].startswith("a:cf:") for b in h.tg.last_buttons(OWNER))
+    assert (await h.svc.repo.get_user(CUSTOMER)).balance == Decimal("0")
+
+
+async def test_owner_manage_user_card(h):
+    await h.text(CUSTOMER, "/start")
+    await h.press(OWNER, "a:us")
+    await h.text(OWNER, str(CUSTOMER))
+    assert str(CUSTOMER) in h.tg.last_text(OWNER)
+    data = [b["callback_data"] for b in h.tg.last_buttons(OWNER)]
+    assert f"a:ub:{CUSTOMER}" in data and f"a:uc:{CUSTOMER}" in data
+
+    await h.press(OWNER, f"a:ub:{CUSTOMER}")
+    assert (await h.svc.repo.get_user(CUSTOMER)).banned
+    assert any(b["text"] == "✅ فك الحظر" for b in h.tg.last_buttons(OWNER))
+    await h.press(OWNER, f"a:ub:{CUSTOMER}")
+    assert not (await h.svc.repo.get_user(CUSTOMER)).banned
+
+    await h.press(OWNER, f"a:uc:{CUSTOMER}")  # credit straight from the card
+    await h.text(OWNER, "3")
+    confirm = next(b for b in h.tg.last_buttons(OWNER) if b["callback_data"].startswith("a:cf:"))
+    await h.press(OWNER, confirm["callback_data"])
+    assert (await h.svc.repo.get_user(CUSTOMER)).balance == Decimal("3")
+
+
+async def test_owner_margin_buttons(h):
+    await h.press(OWNER, "a:mg")
+    assert "نسبة الربح الحالية: 10%" in h.tg.last_text(OWNER)
+    await h.press(OWNER, "a:ms:15")
+    assert await h.svc.runtime.margin() == Decimal("15")
+    await h.press(OWNER, "a:ms:999")  # not a preset: ignored
+    assert await h.svc.runtime.margin() == Decimal("15")
+    await h.press(OWNER, "a:mx")
+    await h.text(OWNER, "١٢٫٥")
+    assert await h.svc.runtime.margin() == Decimal("12.5")
+
+
+async def test_owner_order_search_and_pending_buttons(h):
+    await h.press(OWNER, "a:od")
+    await h.text(OWNER, "not-a-uuid")
+    assert "غير صالح" in h.tg.last_text(OWNER)
+    await h.text(OWNER, "11111111-1111-4111-8111-111111111111")
+    assert "غير موجود" in h.tg.last_text(OWNER)
+    await h.press(OWNER, "a:open")
+    assert "ما فيه طلبات معلّقة" in h.tg.last_text(OWNER)
+
+
+async def test_customer_cannot_use_owner_buttons(h):
+    await h.text(CUSTOMER, "/start")
+    before = len(h.tg.sent(CUSTOMER))
+    for data in ("a:cr", "a:us", "a:mg", "a:ms:50", f"a:ub:{CUSTOMER}", "a:cf:deadbeef"):
+        await h.press(CUSTOMER, data)
+    await h.text(CUSTOMER, str(CUSTOMER))  # would be an ID answer for an owner prompt
+    sent = [p["text"] for p in h.tg.sent(CUSTOMER)[before:]]
+    assert all("آيدي العميل" not in t and "تأكيد" not in t for t in sent)
+    assert await h.svc.runtime.margin() == Decimal("10")
+    assert not (await h.svc.repo.get_user(CUSTOMER)).banned
