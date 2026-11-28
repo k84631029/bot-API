@@ -702,9 +702,11 @@ async def test_transfer_approved_by_owner(h):
     confirm = next(b for b in h.tg.last_buttons(CUSTOMER) if b["callback_data"].startswith("t:ok:"))
     await h.press(CUSTOMER, confirm["callback_data"])
 
-    assert "بانتظار موافقة المالك" in h.tg.last_text(CUSTOMER)
+    assert h.tg.last_text(CUSTOMER).startswith("⏳ تم خصم المبلغ وهو محجوز لدى البوت\n"
+                                                "بانتظار موافقة المالك")
     assert "رصيدك الحالي: 30.00" in h.tg.last_text(CUSTOMER)
     assert "وصلك تحويل" in h.tg.last_text(STRANGER)
+    assert "المبلغ محجوز لدى البوت" in h.tg.last_text(STRANGER)
     assert await _balance_of(h, CUSTOMER) == Decimal("30.00")
     assert await _balance_of(h, STRANGER) == Decimal("0")
 
@@ -716,7 +718,9 @@ async def test_transfer_approved_by_owner(h):
     await h.press(OWNER, approve["callback_data"])
     assert await _balance_of(h, STRANGER) == Decimal("20.00")
     assert "تمت الموافقة" in h.tg.last_text(STRANGER)
+    assert f"🆔: <code>{CUSTOMER}</code>" in h.tg.last_text(STRANGER)
     assert "وصل تحويلك" in h.tg.last_text(CUSTOMER)
+    assert "شكراً لاستخدامك خدمة التحويل" in h.tg.last_text(CUSTOMER)
     assert "وافقت على تحويل" in h.tg.last_text(OWNER)
 
     await h.press(OWNER, approve["callback_data"])  # second tap: nothing more

@@ -705,12 +705,13 @@ async def transfer_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     sender_name = update.effective_user.first_name or str(tg_id)
     await s.repo.log_user(tg_id, "transfer_requested", f"{transfer.id} -> {op['to']} {amount}")
-    await _show(update, f"✅ تم التحويل\n{PENDING_LINE}\n\n"
+    await _show(update, "⏳ تم خصم المبلغ وهو محجوز لدى البوت\n"
+                        "بانتظار موافقة المالك\n\n"
                         f"حوّلت {s.money(amount)} إلى {esc(op['name'])}\n"
                         f"رصيدك الحالي: {s.money(new_balance)}", home_markup())
     try:
         await context.bot.send_message(
-            op["to"], f"💰 وصلك تحويل!\n{PENDING_LINE}\n\n"
+            op["to"], f"💰 وصلك تحويل!\nالمبلغ محجوز لدى البوت\n{PENDING_LINE}\n\n"
                       f"من: {esc(sender_name)}\nالمبلغ: {s.money(amount)}\n"
                       "يوصل لمحفظتك أول ما يوافق المالك.",
             parse_mode="HTML", reply_markup=home_markup())

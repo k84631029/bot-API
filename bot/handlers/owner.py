@@ -1127,11 +1127,14 @@ async def _btn_decide(update: Update, context: ContextTypes.DEFAULT_TYPE, transf
     if approve:
         messages = [
             (receiver, "✅ تمت الموافقة على التحويل\n\n"
-                       f"من: {esc(sender_name)}\nالمبلغ: {amount}\n"
+                       f"من: {esc(sender_name)}\n"
+                       f"🆔: <code>{sender.telegram_id if sender else '?'}</code>\n"
+                       f"المبلغ: {amount}\n"
                        f"رصيدك الحالي: {s.money(new_balance)}",
              InlineKeyboardMarkup([[InlineKeyboardButton("🛒 المنتجات", callback_data="m:shop"),
                                     InlineKeyboardButton("🏠 القائمة", callback_data="m:home")]])),
-            (sender, f"✅ وصل تحويلك إلى {esc(receiver_name)} ({amount})", home),
+            (sender, f"✅ وصل تحويلك إلى {esc(receiver_name)} ({amount})\n\n"
+                     "شكراً لاستخدامك خدمة التحويل 🌹", home),
         ]
     else:
         messages = [
